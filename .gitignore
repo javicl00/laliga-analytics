@@ -1,0 +1,60 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Entornos virtuales ────────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+.env/
+
+# ── Variables de entorno / secretos ──────────────────────────────────────────
+.env
+!.env.example
+*.pem
+*.key
+
+# ── Datos y modelos (no versionar binarios grandes) ───────────────────────────
+data/raw/
+data/processed/
+data/features/
+models/*.pkl
+models/*.joblib
+models/*.cbm
+models/*.bin
+!models/.gitkeep
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+logs/
+*.log
+
+# ── Cobertura y tests ─────────────────────────────────────────────────────────
+.coverage
+.pytest_cache/
+htmlcov/
+
+# ── IDEs ──────────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store
+
+# ── Docker ────────────────────────────────────────────────────────────────────
+docker-compose.override.yml
+
+# ── HAR / capturas de red (pueden contener claves) ────────────────────────────
+*.har

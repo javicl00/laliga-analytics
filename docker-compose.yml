@@ -1,0 +1,51 @@
+version: "3.9"
+
+services:
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql:/docker-entrypoint-initdb.d   # ejecuta *.sql al iniciar
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  etl:
+    build: .
+    restart: "no"
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+    command: python -m src.ingestion.etl_v2
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+
+  api:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    command: uvicorn src.serving.app:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - ./src:/app/src
+      - ./models:/app/models
+
+volumes:
+  postgres_data:

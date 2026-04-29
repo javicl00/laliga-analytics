@@ -1,76 +1,36 @@
-"""Normalizador de clasificación.
+"""Normalizador de clasificacion.
 
-Fuente real: GET /subscriptions/{slug}/standing
-Estructura verificada:
-  total: int
-  standings: [
-    {
-      played, points, won, drawn, lost,
-      goals_for, goals_against, goal_difference (str),
-      position, previous_position, difference_position,
-      team: {id, slug, name, shortname, ...}
-    }
-  ]
-
-NOTA: goal_difference viene como string (ej: "+5", "-3"), se convierte a int.
-NOTA: El endpoint devuelve la clasificación ACTUAL (no por jornada).
-        Para snapshots históricos hay que llamar con cada gameweek_id.
+Endpoint: GET /subscriptions/{slug}/standing
+Clave raiz: 'standings'
+Campos clave: position, points, played, won, drawn, lost,
+               goals_for, goals_against, goal_difference,
+               team.id, qualify.name
 """
 from __future__ import annotations
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 
-def _parse_gd(value: Any) -> Optional[int]:
-    """Convierte goal_difference a int (puede venir como str '+5' o '-3')."""
-    if value is None:
-        return None
-    try:
-        return int(str(value).replace("+", ""))
-    except (ValueError, TypeError):
-        return None
-
-
-def normalize_standing(
-    standing_payload: Any,
-    season_id: int,
-    gameweek_id: int,
-    snapshot_ts: str,
-) -> List[Dict]:
-    """Normaliza el payload de standing a filas para ``standings_snapshots``.
-
-    Parameters
-    ----------
-    standing_payload:
-        JSON devuelto por GET /subscriptions/{slug}/standing.
-    season_id:
-        ID interno de la temporada.
-    gameweek_id:
-        ID de la jornada a la que corresponde este snapshot.
-    snapshot_ts:
-        Timestamp ISO 8601 del momento de extracción.
-
-    Returns
-    -------
-    Lista de dicts listos para insertar en ``standings_snapshots``.
-    """
-    rows = standing_payload.get("standings", [])
-    result = []
-    for row in rows:
-        team = row.get("team") or {}
-        result.append({
-            "season_id": season_id,
-            "gameweek_id": gameweek_id,
-            "team_id": team.get("id"),
-            "snapshot_ts": snapshot_ts,
-            "points": row.get("points"),
-            "position": row.get("position"),
-            "won": row.get("won"),
-            "drawn": row.get("drawn"),
-            "lost": row.get("lost"),
-            "goals_for": row.get("goals_for"),
-            "goals_against": row.get("goals_against"),
-            "goal_difference": _parse_gd(row.get("goal_difference")),
-            "played": row.get("played"),
-            "previous_position": row.get("previous_position"),
+def normalize_standing(payload: Any, season_id: int) -> List[Dict]:
+    rows = []
+    for raw in payload.get("standings", []):
+        team = raw.get("team") or {}
+        qualify = raw.get("qualify") or {}
+        try:
+            gd = int(str(raw.get("goal_difference", "0")).replace("+", ""))
+        except (ValueError, TypeError):
+            gd = 0
+        rows.append({
+            "season_id":       season_id,
+            "team_id":         team.get("id"),
+            "position":        raw.get("position"),
+            "points":          raw.get("points"),
+            "played":          raw.get("played"),
+            "won":             raw.get("won"),
+            "drawn":           raw.get("drawn"),
+            "lost":            raw.get("lost"),
+            "goals_for":       raw.get("goals_for"),
+            "goals_against":   raw.get("goals_against"),
+            "goal_difference": gd,
+            "qualify_name":    qualify.get("name"),
         })
-    return result
+    return rows
