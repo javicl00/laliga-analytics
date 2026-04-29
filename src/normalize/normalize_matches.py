@@ -1,24 +1,42 @@
 """Normalizador de partidos.
 
-Fuente real verificada:
-  Los partidos NO están en subscription.rounds[].gameweeks[].
-  Los gameweeks solo contienen: id, week, name, shortname, date.
+Endpoint real verificado:
+  GET /matches?subscriptionId={slug}&gameweekId={gameweek_id}
 
-  Estrategia de extracción de partidos (en orden de preferencia):
-  1. GET /subscriptions/{slug}/gameweek/{gameweek_id}/matches
-     → Endpoint por jornada individual (a verificar)
-  2. GET /subscriptions/{slug}/calendar
-     → Endpoint de calendario completo (a verificar)
-  3. Extracción desde payload de resultados por equipo
+Estructura verificada (2025-04-29):
+  total: int
+  matches: [
+    {
+      id,              → match_id
+      name, slug,
+      date,            → kickoff_at (ISO 8601 con tz)
+      time,            → igual que date
+      hashtag,
+      competition: {id, name, slug, main, opta_id, lde_id},
+      status,          → 'PreMatch', 'FinishedPeriod', 'FullTime', etc.
+      home_team: {id, slug, name, shortname, ...},
+      away_team: {id, slug, name, shortname, ...},
+      gameweek: {id, week, name, shortname, date},
+      venue: {id, name, ...},
+      season: {id, year, name, ...},
+      is_brand_day,
+      opta_id,
+      lde_id
+    }
+  ]
 
-  Este módulo normaliza el formato esperado una vez confirmado el endpoint.
-  Se implementa con duck typing sobre las claves conocidas.
+NOTA: El endpoint devuelve partidos de TODAS las competiciones si no se filtra.
+       Filtrar siempre por competition_id de LaLiga para evitar ruido.
+       Competition LaLiga EA Sports = id a confirmar por suscripción.
+
+NOTA: score/goles NO aparece en el payload de /matches (solo metadata).
+       Los goles se obtienen desde un endpoint de detalle por partido:
+       GET /matches/{match_id}  → pendiente de verificar.
 """
 from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 
-# Mapeo de status conocidos de la API a valores canónicos internos
 STATUS_MAP = {
     "FinishedPeriod": "finished",
     "FullTime": "finished",
@@ -31,69 +49,73 @@ STATUS_MAP = {
 }
 
 
-def normalize_match(raw_match: Dict, season_id: int, gameweek_id: int) -> Dict:
-    """Normaliza un único partido al esquema interno de la tabla ``matches``.
+def normalize_match(raw: Dict, season_id: int) -> Dict:
+    """Normaliza un partido al esquema interno de la tabla ``matches``.
 
-    Acepta cualquiera de los formatos observados en la API:
-    - Con claves snake_case: home_team, away_team, kickoff_at
-    - Con claves camelCase: homeTeam, awayTeam, kickoffAt  (fallback)
+    IMPORTANTE: home_goals y away_goals son None hasta que se obtenga
+    el detalle del partido desde GET /matches/{id}.
     """
-    home = raw_match.get("home_team") or raw_match.get("homeTeam") or {}
-    away = raw_match.get("away_team") or raw_match.get("awayTeam") or {}
+    home = raw.get("home_team") or {}
+    away = raw.get("away_team") or {}
+    gameweek = raw.get("gameweek") or {}
+    venue = raw.get("venue") or {}
+    competition = raw.get("competition") or {}
 
-    # Score puede estar en score{}, result{} o directamente
-    score = raw_match.get("score") or raw_match.get("result") or {}
-    home_goals = (
-        score.get("home") or score.get("homeGoals")
-        or raw_match.get("home_goals") or raw_match.get("homeGoals")
-    )
-    away_goals = (
-        score.get("away") or score.get("awayGoals")
-        or raw_match.get("away_goals") or raw_match.get("awayGoals")
-    )
-
-    raw_status = raw_match.get("status") or raw_match.get("state") or ""
+    raw_status = raw.get("status") or ""
     canonical_status = STATUS_MAP.get(raw_status, raw_status.lower() if raw_status else None)
 
-    kickoff = (
-        raw_match.get("kickoff_at")
-        or raw_match.get("kickoffAt")
-        or raw_match.get("date")
-        or raw_match.get("startTime")
-    )
-
-    venue = raw_match.get("venue") or raw_match.get("stadium") or {}
-
     return {
-        "match_id": raw_match.get("id"),
+        "match_id": raw.get("id"),
         "season_id": season_id,
-        "gameweek_id": gameweek_id,
-        "kickoff_at": kickoff,
+        "gameweek_id": gameweek.get("id"),
+        "gameweek_week": gameweek.get("week"),
+        "kickoff_at": raw.get("date"),          # ISO 8601 con tz
         "home_team_id": home.get("id"),
         "away_team_id": away.get("id"),
-        "home_goals": int(home_goals) if home_goals is not None else None,
-        "away_goals": int(away_goals) if away_goals is not None else None,
+        "home_goals": None,                     # Requiere GET /matches/{id}
+        "away_goals": None,
         "status": canonical_status,
+        "raw_status": raw_status,
+        "competition_id": competition.get("id"),
+        "competition_slug": competition.get("slug"),
+        "venue_id": venue.get("id") if isinstance(venue, dict) else None,
         "venue_name": venue.get("name") if isinstance(venue, dict) else None,
+        "opta_id": raw.get("opta_id"),
+        "lde_id": raw.get("lde_id"),
+        "is_brand_day": raw.get("is_brand_day", False),
     }
 
 
-def normalize_matches_list(
+def normalize_matches_page(
     matches_payload: Any,
     season_id: int,
-    gameweek_id: int,
+    laliga_competition_id: Optional[int] = None,
 ) -> List[Dict]:
-    """Normaliza una lista de partidos desde cualquier payload conocido."""
-    # Intenta extraer la lista desde claves conocidas
-    matches = (
-        matches_payload.get("matches")
-        or matches_payload.get("match_days")
-        or matches_payload.get("events")
-        or matches_payload.get("data")
-        or []
-    )
-    # Si el payload es directamente una lista
-    if isinstance(matches_payload, list):
-        matches = matches_payload
+    """Normaliza un payload de GET /matches?subscriptionId=...&gameweekId=...
 
-    return [normalize_match(m, season_id, gameweek_id) for m in matches if isinstance(m, dict)]
+    Parameters
+    ----------
+    matches_payload:
+        JSON devuelto por el endpoint.
+    season_id:
+        ID interno de la temporada.
+    laliga_competition_id:
+        Si se especifica, filtra solo partidos de esa competición.
+        Usar para excluir Copa, Champions, etc. del mismo payload.
+
+    Returns
+    -------
+    Lista de dicts normalizados para insertar en ``matches``.
+    """
+    raw_list = matches_payload.get("matches", [])
+    result = []
+    for raw in raw_list:
+        if not isinstance(raw, dict):
+            continue
+        # Filtro por competición si se especifica
+        if laliga_competition_id is not None:
+            comp_id = (raw.get("competition") or {}).get("id")
+            if comp_id != laliga_competition_id:
+                continue
+        result.append(normalize_match(raw, season_id))
+    return result

@@ -1,12 +1,15 @@
 """Cliente Python parametrizable para la API pública de LaLiga.
 
-Cambios respecto a v1 (basados en estructura real verificada):
-- /results → 404. Los partidos están en /gameweek/{id}/matches o /calendar.
-- team_stats usa clave 'team_stats' (no 'clubs' ni 'teams').
-- player_stats usa clave 'player_stats' (no 'players').
-- standing usa clave 'standings'.
-- stats es lista [{name, stat}], no dict plano.
-- Añadido: get_gameweek_matches, get_calendar para obtener partidos.
+Endpoints verificados a 2025-04-29:
+  ✔ GET /global-data?v3=
+  ✔ GET /subscriptions/{slug}                        → teams[], rounds[].gameweeks[]
+  ✔ GET /subscriptions/{slug}/standing               → standings[]
+  ✔ GET /subscriptions/{slug}/teams/stats            → team_stats[]
+  ✔ GET /subscriptions/{slug}/players/stats          → player_stats[]
+  ✔ GET /matches?subscriptionId={slug}&gameweekId={id} → matches[]
+  ✔ GET /matches/{id}                                → match detail (scores)
+  ✘ GET /subscriptions/{slug}/results                → 404 en 2024 y 2025
+  ✘ GET /subscriptions/{slug}/calendar               → 404
 """
 from __future__ import annotations
 
@@ -71,7 +74,7 @@ class LaLigaClient:
         return r.json()
 
     # ------------------------------------------------------------------
-    # Endpoints verificados
+    # Metadatos de temporada
     # ------------------------------------------------------------------
 
     def get_global_data(self) -> Any:
@@ -82,8 +85,12 @@ class LaLigaClient:
         return self.get(f"subscriptions/{subscription_slug}")
 
     def get_standing(self, subscription_slug: str) -> Any:
-        """Clasificación actual. Claves: total, standings[]."""
+        """Clave raíz: 'standings'. goal_difference viene como string."""
         return self.get(f"subscriptions/{subscription_slug}/standing")
+
+    # ------------------------------------------------------------------
+    # Stats
+    # ------------------------------------------------------------------
 
     def get_teams_stats(
         self,
@@ -93,7 +100,7 @@ class LaLigaClient:
         order_field: str = "name",
         order_type: str = "ASC",
     ) -> Any:
-        """Stats de equipos. Clave raíz real: 'team_stats' (no 'clubs')."""
+        """Clave raíz real: 'team_stats'. Stats = [{name, stat}]."""
         return self.get(
             f"subscriptions/{subscription_slug}/teams/stats",
             {"limit": limit, "offset": offset,
@@ -108,7 +115,7 @@ class LaLigaClient:
         order_field: str = "name",
         order_type: str = "ASC",
     ) -> Any:
-        """Stats de jugadores. Clave raíz real: 'player_stats' (no 'players')."""
+        """Clave raíz real: 'player_stats'. Stats = [{name, stat}]."""
         return self.get(
             f"subscriptions/{subscription_slug}/players/stats",
             {"limit": limit, "offset": offset,
@@ -116,86 +123,90 @@ class LaLigaClient:
         )
 
     def get_all_players_stats(self, subscription_slug: str, page_size: int = 100) -> List[Dict]:
-        """Pagina sobre player_stats hasta agotar."""
+        """Extrae todas las páginas de player_stats."""
         all_players: List[Dict] = []
         offset = 0
         while True:
             page = self.get_players_stats(subscription_slug, limit=page_size, offset=offset)
-            players = page.get("player_stats", [])  # clave real verificada
+            players = page.get("player_stats", [])
             if not players:
                 break
             all_players.extend(players)
-            if len(players) < page_size:
+            total = page.get("total", 0)
+            if offset + len(players) >= total:
                 break
             offset += page_size
             time.sleep(0.3)
         return all_players
 
     def get_all_teams_stats(self, subscription_slug: str, page_size: int = 20) -> List[Dict]:
-        """Pagina sobre team_stats (20 equipos, normalmente 1 página)."""
+        """Extrae todas las páginas de team_stats."""
         all_teams: List[Dict] = []
         offset = 0
         while True:
             page = self.get_teams_stats(subscription_slug, limit=page_size, offset=offset)
-            teams = page.get("team_stats", [])  # clave real verificada
+            teams = page.get("team_stats", [])
             if not teams:
                 break
             all_teams.extend(teams)
-            if len(teams) < page_size:
+            total = page.get("total", 0)
+            if offset + len(teams) >= total:
                 break
             offset += page_size
             time.sleep(0.3)
         return all_teams
 
     # ------------------------------------------------------------------
-    # Endpoints de partidos (estructura a confirmar, pendiente sondeo)
+    # Partidos  (endpoint real: /matches?subscriptionId=...&gameweekId=...)
     # ------------------------------------------------------------------
 
-    def get_gameweek_matches(self, subscription_slug: str, gameweek_id: int) -> Optional[Any]:
-        """Intenta obtener los partidos de una jornada concreta.
+    def get_matches_by_gameweek(
+        self,
+        subscription_slug: str,
+        gameweek_id: int,
+    ) -> Any:
+        """Partidos de una jornada. Clave raíz: 'matches'.
 
-        Prueba múltiples variantes de URL hasta encontrar la correcta.
-        Devuelve None si ninguna funciona.
+        NOTA: el payload incluye partidos de todas las competiciones
+        del mismo slot de jornada. Filtrar por competition_id en el normalizador.
         """
-        candidates = [
-            f"subscriptions/{subscription_slug}/gameweek/{gameweek_id}/matches",
-            f"subscriptions/{subscription_slug}/matches?gameweekId={gameweek_id}",
-            f"subscriptions/{subscription_slug}/calendar?gameweekId={gameweek_id}",
-        ]
-        for path in candidates:
-            try:
-                result = self.get(path)
-                logger.info("get_gameweek_matches: working path = %s", path)
-                return result
-            except requests.HTTPError as exc:
-                if exc.response is not None and exc.response.status_code == 404:
-                    logger.debug("404 for path: %s", path)
-                    continue
-                raise
-        logger.warning("get_gameweek_matches: no working path found for gw=%s", gameweek_id)
-        return None
+        return self.get(
+            "matches",
+            {"subscriptionId": subscription_slug, "gameweekId": gameweek_id},
+        )
 
-    def get_calendar(self, subscription_slug: str) -> Optional[Any]:
-        """Intenta obtener el calendario completo de la temporada."""
-        candidates = [
-            f"subscriptions/{subscription_slug}/calendar",
-            f"subscriptions/{subscription_slug}/schedule",
-            f"subscriptions/{subscription_slug}/fixtures",
-        ]
-        for path in candidates:
-            try:
-                result = self.get(path)
-                logger.info("get_calendar: working path = %s", path)
-                return result
-            except requests.HTTPError as exc:
-                if exc.response is not None and exc.response.status_code == 404:
-                    continue
-                raise
-        return None
+    def get_all_matches(
+        self,
+        subscription_slug: str,
+        gameweek_ids: List[int],
+        sleep: float = 0.4,
+    ) -> Dict[int, Any]:
+        """Extrae partidos para todas las jornadas dadas.
 
-    # ------------------------------------------------------------------
-    # Fan-out por partido
-    # ------------------------------------------------------------------
+        Returns
+        -------
+        Dict gameweek_id -> payload raw.
+        """
+        results: Dict[int, Any] = {}
+        total = len(gameweek_ids)
+        for i, gw_id in enumerate(gameweek_ids, 1):
+            logger.info("Fetching matches gw %d/%d (id=%s)", i, total, gw_id)
+            try:
+                results[gw_id] = self.get_matches_by_gameweek(subscription_slug, gw_id)
+                time.sleep(sleep)
+            except requests.HTTPError as exc:
+                logger.warning("Error fetching gw %s: %s", gw_id, exc)
+                results[gw_id] = None
+        return results
+
+    def get_match_detail(self, match_id: int) -> Optional[Any]:
+        """Detalle de un partido incluyendo score/goles."""
+        try:
+            return self.get(f"matches/{match_id}")
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                return None
+            raise
 
     def get_match_stats(self, match_id: int) -> Optional[Any]:
         try:
