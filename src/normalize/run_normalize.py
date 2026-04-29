@@ -1,10 +1,10 @@
-"""Normalizador: raw_snapshots → tablas relacionales.
+"""Normalizador: raw_snapshots -> tablas relacionales.
 
 Lee los payloads JSON de raw_snapshots y puebla:
   - teams
   - seasons
-  - gameweeks
-  - matches  (con result calculado y gameweek_week)
+  - gameweeks   (desde subscription Y desde los propios partidos)
+  - matches
   - standings
 
 Uso:
@@ -44,27 +44,22 @@ def _int(v) -> Optional[int]:
 # ------------------------------------------------------------------ parsers
 
 def parse_subscription(payload: Any) -> Dict:
-    """Extrae season + teams + gameweeks del payload de subscription."""
     sub = payload.get("subscription") or payload
-    competition = payload.get("competition") or {}
 
-    # Season
-    season_raw = sub.get("season") or sub.get("season_name") or ""
     season_slug = sub.get("slug", "")
-    # Intentar extraer year del slug (laliga-easports-2025 -> 2025)
     year = None
     for part in season_slug.split("-"):
         if part.isdigit() and len(part) == 4:
             year = int(part)
             break
+
     season = {
         "season_id": sub.get("id"),
-        "name":      sub.get("season_name") or season_raw,
+        "name":      sub.get("season_name") or sub.get("season") or "",
         "year":      year or 2025,
         "slug":      season_slug,
     }
 
-    # Teams — pueden estar en sub["teams"] o en sub["subscription"]["teams"]
     teams_raw = sub.get("teams") or []
     teams = []
     for t in teams_raw:
@@ -78,13 +73,11 @@ def parse_subscription(payload: Any) -> Dict:
             "lde_id":    _int(t.get("lde_id")),
         })
 
-    # Gameweeks
+    # Gameweeks desde subscription (puede ser incompleto)
     gameweeks_raw = sub.get("gameweeks") or sub.get("rounds") or []
     gameweeks = []
     for gw in gameweeks_raw:
-        gw_date = None
-        if gw.get("start_date"):
-            gw_date = gw["start_date"][:10]
+        gw_date = gw["start_date"][:10] if gw.get("start_date") else None
         gameweeks.append({
             "gameweek_id": _int(gw.get("id")),
             "season_id":   season["season_id"],
@@ -94,6 +87,39 @@ def parse_subscription(payload: Any) -> Dict:
         })
 
     return {"season": season, "teams": teams, "gameweeks": gameweeks}
+
+
+def extract_gameweeks_from_matches(snapshots, season_id: int) -> List[Dict]:
+    """Extrae gameweeks unicos embebidos en los payloads de partidos.
+
+    Cada partido tiene un campo 'gameweek': {id, week, name, ...}.
+    Esta funcion los consolida en una lista deduplicada para
+    garantizar que todos los gameweek_id existen antes de insertar matches.
+    """
+    seen = set()
+    gameweeks = []
+    for row in snapshots:
+        if not row["resource"].startswith("matches_week_"):
+            continue
+        payload = json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"]
+        for m in payload.get("matches", []):
+            gw = m.get("gameweek") or {}
+            gw_id = _int(gw.get("id"))
+            if not gw_id or gw_id in seen:
+                continue
+            seen.add(gw_id)
+            gw_date = gw.get("start_date") or gw.get("date")
+            if gw_date:
+                gw_date = gw_date[:10]
+            gameweeks.append({
+                "gameweek_id": gw_id,
+                "season_id":   season_id,
+                "week":        _int(gw.get("week") or gw.get("round")),
+                "name":        gw.get("name"),
+                "date":        gw_date,
+            })
+    logger.info("Extracted %d unique gameweeks from match payloads", len(gameweeks))
+    return gameweeks
 
 
 def parse_standing(payload: Any, season_id: int) -> List[Dict]:
@@ -129,15 +155,12 @@ def parse_matches_week(payload: Any, season_id: int, week: int) -> List[Dict]:
         venue = m.get("venue") or {}
         home_score = _int(m.get("home_score"))
         away_score = _int(m.get("away_score"))
-        # gameweek
         gw = m.get("gameweek") or {}
-        gw_id   = _int(gw.get("id"))
-        gw_week = _int(gw.get("week")) or week
         rows.append({
             "match_id":        _int(m.get("id")),
             "season_id":       season_id,
-            "gameweek_id":     gw_id,
-            "gameweek_week":   gw_week,
+            "gameweek_id":     _int(gw.get("id")),
+            "gameweek_week":   _int(gw.get("week")) or week,
             "kickoff_at":      m.get("kickoff_at") or m.get("date"),
             "home_team_id":    _int((m.get("home_team") or {}).get("id")),
             "away_team_id":    _int((m.get("away_team") or {}).get("id")),
@@ -247,13 +270,13 @@ def run(db_url: str | None = None) -> None:
         snapshots = conn.execute(text(
             "SELECT resource, payload FROM raw_snapshots ORDER BY resource"
         )).mappings().all()
+    snapshots = list(snapshots)
 
     logger.info("Found %d raw snapshots to normalize", len(snapshots))
 
     season_id: int | None = None
-    sub_data: Dict = {}
 
-    # Paso 1: subscription → season + teams + gameweeks
+    # Paso 1: subscription -> season + teams + gameweeks (de subscription)
     for row in snapshots:
         if row["resource"] == "subscription":
             payload = json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"]
@@ -263,7 +286,7 @@ def run(db_url: str | None = None) -> None:
                 upsert_season(conn, sub_data["season"])
                 upsert_teams(conn, sub_data["teams"])
                 upsert_gameweeks(conn, sub_data["gameweeks"])
-            logger.info("Upserted season=%s teams=%d gameweeks=%d",
+            logger.info("Upserted season=%s teams=%d gameweeks_from_sub=%d",
                         season_id, len(sub_data["teams"]), len(sub_data["gameweeks"]))
             break
 
@@ -271,7 +294,12 @@ def run(db_url: str | None = None) -> None:
         logger.error("No subscription snapshot found — cannot normalize")
         return
 
-    # Paso 2: matches_week_* → matches
+    # Paso 1b: extraer gameweeks embebidos en los partidos (fuente de verdad real)
+    match_gameweeks = extract_gameweeks_from_matches(snapshots, season_id)
+    with engine.begin() as conn:
+        upsert_gameweeks(conn, match_gameweeks)
+
+    # Paso 2: matches_week_* -> matches
     total_matches = 0
     for row in snapshots:
         resource = row["resource"]
@@ -287,7 +315,7 @@ def run(db_url: str | None = None) -> None:
 
     logger.info("Total matches upserted: %d", total_matches)
 
-    # Paso 3: standing → standings
+    # Paso 3: standing -> standings
     for row in snapshots:
         if row["resource"] == "standing":
             payload = json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"]
