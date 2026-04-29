@@ -1,0 +1,17 @@
+competitions:
+  primera_division:
+    api_slug: primera-division
+    name: LALIGA EA SPORTS
+    seasons:
+      2025:
+        subscription_slug: laliga-easports-2025
+        subscription_id: 375
+        resources: [results, standing, stats, statsteam, clubs, squad]
+        has_match_stats: false
+        has_match_events: false
+      2024:
+        subscription_slug: laliga-easports-2024
+        subscription_id: null
+        resources: [results, standing, stats]
+        has_match_stats: false
+        has_match_events: false

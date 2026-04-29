@@ -1,0 +1,15 @@
+requests
+pandas
+numpy
+scipy
+sqlalchemy
+psycopg2-binary
+pyyaml
+scikit-learn
+lightgbm
+catboost
+mlflow
+fastapi
+uvicorn
+pydantic
+urllib3
