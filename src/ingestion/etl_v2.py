@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from src.clients.laliga_api import LaLigaClient
-from src.storage.repository import RawRepository
+from src.storage.repository import PostgresRawRepository
 
 logger = logging.getLogger(__name__)
 
@@ -35,28 +35,20 @@ class SeasonConfig:
     competition_slug: str
     season_label: str
     subscription_slug: str
-    num_gameweeks: int = 38          # Jornadas regulares de liga
-    main_only: bool = True           # Filtrar solo competition.main=True en /matches
-    fetch_match_stats: bool = False  # GET /matches/{id}/stats (puede ser 404)
-    fetch_match_events: bool = False # GET /matches/{id}/events (puede ser 404)
-    weeks: List[int] = field(default_factory=list)  # Si vacio, usa range(1, num_gameweeks+1)
+    num_gameweeks: int = 38
+    main_only: bool = True
+    fetch_match_stats: bool = False
+    fetch_match_events: bool = False
+    weeks: List[int] = field(default_factory=list)
 
 
 class ETLv2:
-    """ETL completo basado en endpoints verificados.
-
-    Parameters
-    ----------
-    client: LaLigaClient
-    repo:   RawRepository
-    season: SeasonConfig
-    sleep:  Segundos entre requests (respetar rate-limit API)
-    """
+    """ETL completo basado en endpoints verificados."""
 
     def __init__(
         self,
         client: LaLigaClient,
-        repo: RawRepository,
+        repo: PostgresRawRepository,
         season: SeasonConfig,
         sleep: float = 0.4,
     ) -> None:
@@ -76,8 +68,6 @@ class ETLv2:
         self._extract_matches_by_week(weeks)
         logger.info("ETL v2 complete | %s %s", self.season.competition_slug, self.season.season_label)
 
-    # ------------------------------------------------------------------
-    # Pasos
     # ------------------------------------------------------------------
 
     def _save(self, resource: str, payload) -> None:
@@ -109,11 +99,6 @@ class ETLv2:
         self._save("players_stats", {"player_stats": players})
 
     def _extract_matches_by_week(self, weeks: List[int]) -> None:
-        """Extrae partidos jornada a jornada.
-
-        Cada payload incluye home_score/away_score directamente.
-        NO se necesita fan-out a /matches/{id}.
-        """
         total = len(weeks)
         for i, week in enumerate(weeks, 1):
             logger.info("Extracting matches week %d/%d (week=%s)", i, total, week)
@@ -122,12 +107,10 @@ class ETLv2:
             )
             self._save(f"matches_week_{week}", payload)
 
-            # Fan-out opcional a stats/events por partido (probablemente 404)
             if self.season.fetch_match_stats or self.season.fetch_match_events:
                 self._fan_out_optional(payload)
 
     def _fan_out_optional(self, matches_payload: dict) -> None:
-        """Fan-out opcional a /matches/{id}/stats y /events."""
         for m in matches_payload.get("matches", []):
             if m.get("status") not in ("FinishedPeriod", "FullTime", "Finished"):
                 continue
@@ -156,7 +139,6 @@ def run_season(
     num_gameweeks: int = 38,
     db_url: Optional[str] = None,
 ) -> None:
-    from src.storage.repository import PostgresRawRepository
     client = LaLigaClient(subscription_key=subscription_key)
     repo = PostgresRawRepository(db_url=db_url)
     season = SeasonConfig(
