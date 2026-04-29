@@ -1,0 +1,41 @@
+# Control de versiones
+.git/
+.gitignore
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+
+# Datos y modelos binarios (se montan como volumen)
+data/
+logs/
+*.har
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Cache Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Tests y cobertura
+.pytest_cache/
+htmlcov/
+.coverage
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+
+# macOS
+.DS_Store
+
+# README y docs (no necesarios en la imagen)
+README.md
+*.md
