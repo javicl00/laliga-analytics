@@ -1,15 +1,27 @@
 """Cliente Python parametrizable para la API pública de LaLiga.
 
-Endpoints verificados a 2025-04-29:
-  ✔ GET /global-data?v3=
-  ✔ GET /subscriptions/{slug}                        → teams[], rounds[].gameweeks[]
-  ✔ GET /subscriptions/{slug}/standing               → standings[]
-  ✔ GET /subscriptions/{slug}/teams/stats            → team_stats[]
-  ✔ GET /subscriptions/{slug}/players/stats          → player_stats[]
-  ✔ GET /matches?subscriptionId={slug}&gameweekId={id} → matches[]
-  ✔ GET /matches/{id}                                → match detail (scores)
-  ✘ GET /subscriptions/{slug}/results                → 404 en 2024 y 2025
-  ✘ GET /subscriptions/{slug}/calendar               → 404
+Endpoints verificados a 2025-04-29 (basados en HAR real del navegador):
+
+  ✔ GET /subscriptions/{slug}
+       → teams[], rounds[].gameweeks[]
+
+  ✔ GET /subscriptions/{slug}/standing
+       → standings[]
+
+  ✔ GET /subscriptions/{slug}/teams/stats
+       → team_stats[]  (stats = [{name, stat}])
+
+  ✔ GET /subscriptions/{slug}/players/stats
+       → player_stats[]  (paginado por offset)
+
+  ✔ GET /matches?subscriptionSlug={slug}&week={week_number}&limit=100
+       → matches[]  CON home_score y away_score incluidos
+       NOTA: param correcto es 'subscriptionSlug' (no 'subscriptionId')
+             y 'week' (numero de jornada, no gameweek_id)
+
+  ✘ GET /matches?subscriptionId=...&gameweekId=...  → funciona pero SIN scores
+  ✘ GET /subscriptions/{slug}/results             → 404
+  ✘ GET /matches/{id}                             → 404
 """
 from __future__ import annotations
 
@@ -68,7 +80,7 @@ class LaLigaClient:
         params["contentLanguage"] = self.language
         params["subscription-key"] = self.subscription_key
         url = f"{self.base_url}/{path.lstrip('/')}"
-        logger.debug("GET %s", url)
+        logger.debug("GET %s params=%s", url, {k: v for k, v in params.items() if k != 'subscription-key'})
         r = self._session.get(url, params=params, timeout=timeout)
         r.raise_for_status()
         return r.json()
@@ -85,7 +97,7 @@ class LaLigaClient:
         return self.get(f"subscriptions/{subscription_slug}")
 
     def get_standing(self, subscription_slug: str) -> Any:
-        """Clave raíz: 'standings'. goal_difference viene como string."""
+        """Clasificación actual. Clave raíz: 'standings'."""
         return self.get(f"subscriptions/{subscription_slug}/standing")
 
     # ------------------------------------------------------------------
@@ -123,7 +135,7 @@ class LaLigaClient:
         )
 
     def get_all_players_stats(self, subscription_slug: str, page_size: int = 100) -> List[Dict]:
-        """Extrae todas las páginas de player_stats."""
+        """Extrae todas las páginas de player_stats usando 'total' para corte."""
         all_players: List[Dict] = []
         offset = 0
         while True:
@@ -132,8 +144,7 @@ class LaLigaClient:
             if not players:
                 break
             all_players.extend(players)
-            total = page.get("total", 0)
-            if offset + len(players) >= total:
+            if offset + len(players) >= page.get("total", 0):
                 break
             offset += page_size
             time.sleep(0.3)
@@ -149,66 +160,71 @@ class LaLigaClient:
             if not teams:
                 break
             all_teams.extend(teams)
-            total = page.get("total", 0)
-            if offset + len(teams) >= total:
+            if offset + len(teams) >= page.get("total", 0):
                 break
             offset += page_size
             time.sleep(0.3)
         return all_teams
 
     # ------------------------------------------------------------------
-    # Partidos  (endpoint real: /matches?subscriptionId=...&gameweekId=...)
+    # Partidos CON scores
     # ------------------------------------------------------------------
 
-    def get_matches_by_gameweek(
+    def get_matches_by_week(
         self,
         subscription_slug: str,
-        gameweek_id: int,
+        week: int,
+        limit: int = 100,
+        order_field: str = "date",
+        order_type: str = "asc",
     ) -> Any:
-        """Partidos de una jornada. Clave raíz: 'matches'.
+        """Partidos de una jornada con home_score y away_score incluidos.
 
-        NOTA: el payload incluye partidos de todas las competiciones
-        del mismo slot de jornada. Filtrar por competition_id en el normalizador.
+        PARAMETROS CORRECTOS verificados en HAR (2025-04-29):
+          subscriptionSlug = slug de la temporada  (NO subscriptionId)
+          week             = numero de jornada 1-38  (NO gameweekId)
+
+        El payload incluye partidos de la competicion principal y puede
+        incluir otras (Copa, Champions mismo slot). Filtrar por competition.id
+        en el normalizador.
         """
         return self.get(
             "matches",
-            {"subscriptionId": subscription_slug, "gameweekId": gameweek_id},
+            {
+                "subscriptionSlug": subscription_slug,
+                "week": week,
+                "limit": limit,
+                "orderField": order_field,
+                "orderType": order_type,
+            },
         )
 
     def get_all_matches(
         self,
         subscription_slug: str,
-        gameweek_ids: List[int],
+        weeks: List[int],
         sleep: float = 0.4,
     ) -> Dict[int, Any]:
-        """Extrae partidos para todas las jornadas dadas.
+        """Extrae partidos para todas las jornadas (por numero de semana 1-38).
 
         Returns
         -------
-        Dict gameweek_id -> payload raw.
+        Dict week -> payload raw con scores incluidos.
         """
         results: Dict[int, Any] = {}
-        total = len(gameweek_ids)
-        for i, gw_id in enumerate(gameweek_ids, 1):
-            logger.info("Fetching matches gw %d/%d (id=%s)", i, total, gw_id)
+        total = len(weeks)
+        for i, week in enumerate(weeks, 1):
+            logger.info("Fetching matches week %d/%d (week=%s)", i, total, week)
             try:
-                results[gw_id] = self.get_matches_by_gameweek(subscription_slug, gw_id)
+                results[week] = self.get_matches_by_week(subscription_slug, week)
                 time.sleep(sleep)
             except requests.HTTPError as exc:
-                logger.warning("Error fetching gw %s: %s", gw_id, exc)
-                results[gw_id] = None
+                logger.warning("Error fetching week %s: %s", week, exc)
+                results[week] = None
         return results
 
-    def get_match_detail(self, match_id: int) -> Optional[Any]:
-        """Detalle de un partido incluyendo score/goles."""
-        try:
-            return self.get(f"matches/{match_id}")
-        except requests.HTTPError as exc:
-            if exc.response is not None and exc.response.status_code == 404:
-                return None
-            raise
-
     def get_match_stats(self, match_id: int) -> Optional[Any]:
+        """Stats de partido. Puede no estar disponible (devuelve None si 404)."""
         try:
             return self.get(f"matches/{match_id}/stats")
         except requests.HTTPError as exc:
@@ -217,6 +233,7 @@ class LaLigaClient:
             raise
 
     def get_match_events(self, match_id: int) -> Optional[Any]:
+        """Eventos de partido. Puede no estar disponible (devuelve None si 404)."""
         try:
             return self.get(f"matches/{match_id}/events")
         except requests.HTTPError as exc:
