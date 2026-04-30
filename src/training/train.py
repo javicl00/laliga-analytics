@@ -8,14 +8,12 @@ Validacion walk-forward por temporada (sin data leakage temporal):
 Metrica principal: RPS (Ranked Probability Score).
 El modelo entrenado se guarda en models/lgbm_v1.pkl.
 
-Nota sobre seleccion de modelo:
-  LightGBM se fija como modelo de produccion independientemente del
-  resultado en val. La razon es que val=T:351 no contiene datos Opta
-  (familia G), lo que sesga la comparacion contra LR. LightGBM es
-  superior cuando las features G estan disponibles (T:375+). La
-  Logistic se entrena unicamente como referencia comparativa.
+Seleccion de modelo:
+  Se comparan LightGBM y LogisticRegression por RPS en val. Gana el de
+  menor RPS. La comparacion es valida porque ambos usan el mismo conjunto
+  de features (determinado por cobertura en train, ver _available()).
 
-Features activas (26 columnas):
+Features activas:
   D - ELO:         elo_diff
   A - Standings:   home/away_points_total, home/away_table_position,
                    home/away_gd_total
@@ -25,8 +23,8 @@ Features activas (26 columnas):
   F - H2H:         h2h_home_wins, h2h_draws, h2h_away_wins
   G - Opta stats:  home/away_possession_last5, home/away_ppda_last5,
                    home/away_shots_ot_last5, home/away_bigchances_last5
-                   (NaN en temporadas sin opta_id: LightGBM los gestiona
-                   de forma nativa; LogisticRegression imputa con 0)
+                   SOLO incluidas si cobertura en train >= OPTA_THRESHOLD.
+                   NaN nativo para LightGBM; fillna(0) para LogisticRegression.
 """
 from __future__ import annotations
 
@@ -46,14 +44,17 @@ from sklearn.preprocessing import StandardScaler
 
 logger = logging.getLogger(__name__)
 
-FEATURE_COLS = [
-    # D: ELO (solo diferencial)
+# Umbral minimo de cobertura (filas no-NaN / total) para incluir familia G
+OPTA_THRESHOLD = 0.10
+
+BASE_COLS = [
+    # D: ELO
     "elo_diff",
     # A: Estado competitivo
     "home_points_total", "away_points_total",
     "home_table_position", "away_table_position",
     "home_gd_total", "away_gd_total",
-    # B: Forma reciente (ultimos 5)
+    # B: Forma reciente
     "home_goals_for_last5",   "home_goals_against_last5",
     "away_goals_for_last5",   "away_goals_against_last5",
     # E: Contexto
@@ -62,39 +63,68 @@ FEATURE_COLS = [
     "gameweek",
     # F: Head-to-Head
     "h2h_home_wins", "h2h_draws", "h2h_away_wins",
-    # G: Opta rolling stats (solo disponibles para temporadas con opta_id)
+]
+
+OPTA_COLS = [
     "home_possession_last5", "away_possession_last5",
     "home_ppda_last5",       "away_ppda_last5",
     "home_shots_ot_last5",   "away_shots_ot_last5",
     "home_bigchances_last5", "away_bigchances_last5",
 ]
+
+FEATURE_COLS = BASE_COLS + OPTA_COLS   # lista completa para referencia
 TARGET_COL   = "result"
 CLASSES      = ["home", "draw", "away"]
 _CLASSES_LEX = sorted(CLASSES)
 
 
-# ──────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────
 # Helpers
-# ──────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────
 
 def _available(df: pd.DataFrame) -> List[str]:
-    """Devuelve las columnas de FEATURE_COLS presentes en df."""
-    return [c for c in FEATURE_COLS if c in df.columns]
+    """Devuelve columnas utiles para el modelo dado un DataFrame.
+
+    Incluye familia G (Opta) solo si su cobertura en df supera OPTA_THRESHOLD.
+    Esto evita que LightGBM aprenda splits espurios sobre columnas 100% NaN
+    cuando ningun partido del split tiene datos Opta.
+    """
+    base = [c for c in BASE_COLS if c in df.columns]
+
+    opta_present = [c for c in OPTA_COLS if c in df.columns]
+    if opta_present:
+        coverage = df[opta_present].notna().mean().mean()
+    else:
+        coverage = 0.0
+
+    if coverage >= OPTA_THRESHOLD:
+        logger.info(
+            "Features Opta INCLUIDAS (cobertura=%.1f%% >= %.0f%%): %s",
+            coverage * 100, OPTA_THRESHOLD * 100, opta_present,
+        )
+        return base + opta_present
+    else:
+        logger.info(
+            "Features Opta EXCLUIDAS (cobertura=%.1f%% < %.0f%%) — "
+            "se activaran cuando train tenga suficientes temporadas con opta_id.",
+            coverage * 100, OPTA_THRESHOLD * 100,
+        )
+        return base
 
 
 def _X_lgbm(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
-    """Features para LightGBM: NaN nativo (no fillna)."""
+    """Features para LightGBM: NaN nativo (sin fillna)."""
     return df[cols]
 
 
 def _X_sklearn(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
-    """Features para modelos sklearn: fillna(0) porque no toleran NaN."""
+    """Features para sklearn: fillna(0) porque Pipeline no tolera NaN."""
     return df[cols].fillna(0)
 
 
-# ──────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────
 # Metrica RPS
-# ──────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────
 
 def rps(y_true: np.ndarray, probs: np.ndarray) -> float:
     """Ranked Probability Score (menor es mejor)."""
@@ -115,9 +145,9 @@ def _reorder_probs(model, probs: np.ndarray) -> np.ndarray:
     return probs[:, [classes.index(c) for c in CLASSES]]
 
 
-# ──────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────
 # Split walk-forward por temporada
-# ──────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────
 
 def temporal_split(
     df: pd.DataFrame,
@@ -147,18 +177,18 @@ def temporal_split(
     return train, val, test
 
 
-# ──────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────
 # Baseline
-# ──────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────
 
 def baseline_probs(train: pd.DataFrame, n: int) -> np.ndarray:
     counts = train[TARGET_COL].value_counts(normalize=True).to_dict()
     return np.tile([counts.get(c, 0.0) for c in CLASSES], (n, 1))
 
 
-# ──────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────
 # Entrenamiento
-# ──────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────
 
 def train_lgbm(train: pd.DataFrame) -> LGBMClassifier:
     cols = _available(train)
@@ -191,9 +221,9 @@ def train_logistic(train: pd.DataFrame) -> Pipeline:
     return pipe
 
 
-# ──────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────
 # Evaluacion
-# ──────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────
 
 def evaluate(model, df: pd.DataFrame, split_name: str = "val") -> Dict[str, float]:
     cols    = [c for c in getattr(model, "_feature_cols_used", FEATURE_COLS) if c in df.columns]
@@ -210,9 +240,9 @@ def evaluate(model, df: pd.DataFrame, split_name: str = "val") -> Dict[str, floa
     return metrics
 
 
-# ──────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────
 # Entrypoint
-# ──────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────
 
 def run(
     features_df: pd.DataFrame,
@@ -236,17 +266,20 @@ def run(
     lgbm         = train_lgbm(train)
     lgbm_metrics = evaluate(lgbm, val, "lgbm_val")
 
-    # LightGBM se fija como modelo de produccion (Opcion A).
-    # val=T:351 carece de datos Opta, lo que sesga la comparacion
-    # contra LR. Logistic se reporta solo como referencia comparativa.
-    # Revisar cuando val incluya una temporada completa con datos Opta.
+    # Seleccion dinamica: gana el modelo con menor RPS en val.
+    # La comparacion es justa porque _available() usa el mismo conjunto
+    # de features para ambos (Opta excluida si cobertura < OPTA_THRESHOLD).
+    if lgbm_metrics["rps"] <= lr_metrics["rps"]:
+        best_model  = lgbm
+        winner_name = "LightGBM"
+    else:
+        best_model  = lr
+        winner_name = "LogisticRegression"
     logger.info(
-        "Modelo guardado: LightGBM (fijo). "
-        "Logistic RPS val=%.4f | LGBM RPS val=%.4f — "
-        "comparacion sesgada por ausencia de features Opta en val.",
-        lr_metrics["rps"], lgbm_metrics["rps"],
+        "Modelo seleccionado: %s (LGBM RPS=%.4f | LR RPS=%.4f)",
+        winner_name, lgbm_metrics["rps"], lr_metrics["rps"],
     )
-    best_model   = lgbm
+
     test_metrics = evaluate(best_model, test, "test") if not test.empty else {}
 
     Path(output_dir).mkdir(exist_ok=True)
@@ -263,6 +296,7 @@ def run(
         "baseline_rps": base_rps,
         "logistic":     lr_metrics,
         "lgbm":         lgbm_metrics,
+        "winner":       winner_name,
         "test":         test_metrics,
         "model_path":   str(model_path),
     }
