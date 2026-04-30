@@ -1,6 +1,6 @@
 """ETL v2 para LaLiga Analytics.
 
-Flujo de extraccion basado en endpoints reales verificados (HAR 2025-04-29):
+Flujo de extraccion basado en endpoints reales verificados (HAR 2025-04-30):
 
   1. subscription    -> equipos maestros + gameweeks (sin partidos)
   2. standing        -> clasificacion actual
@@ -10,15 +10,24 @@ Flujo de extraccion basado en endpoints reales verificados (HAR 2025-04-29):
                      -> partidos CON home_score/away_score incluidos
                         Paralelizado con ThreadPoolExecutor (workers=6)
 
+Slugs verificados (2025-04-30):
+  2021-22  laliga-santander-2021   id=116
+  2022-23  laliga-santander-2022   id=305
+  2023-24  laliga-easports-2023    id=329
+  2024-25  laliga-easports-2024    id=351
+  2025-26  laliga-easports-2025    id=375  (temporada en curso)
+
 Descartado definitivamente:
   x /subscriptions/{slug}/results     -> 404
   x /matches?subscriptionId=...       -> funciona pero SIN scores
   x /matches/{id}                     -> 404
-  x webview /matches                  -> 404
+  x laliga-easports-2022              -> 404 (era LaLiga Santander ese año)
 """
 from __future__ import annotations
 
+import argparse
 import logging
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -31,7 +40,16 @@ from src.storage.repository import PostgresRawRepository
 
 logger = logging.getLogger(__name__)
 
-MAX_WORKERS = 6   # peticiones paralelas a la API LaLiga
+MAX_WORKERS = 6
+
+# Mapa completo de temporadas verificadas
+KNOWN_SEASONS = [
+    {"label": "2021", "slug": "laliga-santander-2021"},
+    {"label": "2022", "slug": "laliga-santander-2022"},
+    {"label": "2023", "slug": "laliga-easports-2023"},
+    {"label": "2024", "slug": "laliga-easports-2024"},
+    {"label": "2025", "slug": "laliga-easports-2025"},
+]
 
 
 @dataclass
@@ -60,7 +78,7 @@ class ETLv2:
         client: LaLigaClient,
         repo: PostgresRawRepository,
         season: SeasonConfig,
-        sleep: float = 0.1,   # reducido: el paralelismo ya regula el ritmo
+        sleep: float = 0.1,
     ) -> None:
         self.client = client
         self.repo = repo
@@ -84,7 +102,6 @@ class ETLv2:
     # ------------------------------------------------------------------
 
     def _save(self, resource: str, payload) -> None:
-        """Thread-safe: serializa escrituras a BD con Lock."""
         with self._db_lock:
             self.repo.save(
                 resource=resource,
@@ -94,14 +111,13 @@ class ETLv2:
             )
 
     def _make_client(self) -> LaLigaClient:
-        """Crea un cliente HTTP independiente para cada thread."""
         return LaLigaClient(
             subscription_key=self.client.subscription_key,
             base_url=self.client.base_url,
         )
 
     # ------------------------------------------------------------------
-    # Pasos secuenciales (no paralelizables entre si)
+    # Pasos secuenciales
     # ------------------------------------------------------------------
 
     def _extract_subscription(self):
@@ -128,10 +144,9 @@ class ETLv2:
     # ------------------------------------------------------------------
 
     def _fetch_week(self, week: int) -> tuple[int, dict]:
-        """Ejecutado en un thread: descarga una jornada y devuelve (week, payload)."""
         client = self._make_client()
         payload = client.get_matches_by_week(self.season.subscription_slug, week)
-        time.sleep(self.sleep)   # cortesia minima por thread
+        time.sleep(self.sleep)
         return week, payload
 
     def _extract_matches_by_week(self, weeks: List[int]) -> None:
@@ -183,9 +198,28 @@ def run_season(
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    run_season(
-        competition_slug="primera-division",
-        season_label="2025",
-        subscription_slug="laliga-easports-2025",
-        subscription_key="c13c3a8e2f6b46da9c5c425cf61fab3e",
+
+    parser = argparse.ArgumentParser(description="LaLiga ETL v2")
+    parser.add_argument(
+        "--season",
+        choices=[s["label"] for s in KNOWN_SEASONS] + ["all"],
+        default="all",
+        help="Temporada a extraer (2021-2025) o 'all' para todas (default: all)",
     )
+    args = parser.parse_args()
+
+    subscription_key = os.environ.get("LALIGA_API_KEY", "c13c3a8e2f6b46da9c5c425cf61fab3e")
+
+    seasons_to_run = (
+        KNOWN_SEASONS
+        if args.season == "all"
+        else [s for s in KNOWN_SEASONS if s["label"] == args.season]
+    )
+
+    for s in seasons_to_run:
+        run_season(
+            competition_slug="primera-division",
+            season_label=s["label"],
+            subscription_slug=s["slug"],
+            subscription_key=subscription_key,
+        )
