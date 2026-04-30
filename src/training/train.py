@@ -23,13 +23,15 @@ import logging
 import os
 import pickle
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 from lightgbm import LGBMClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import log_loss
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +47,8 @@ FEATURE_COLS = [
 ]
 TARGET_COL = "result"   # home | draw | away
 CLASSES    = ["home", "draw", "away"]
+# Orden lexicografico que espera sklearn.metrics.log_loss internamente
+_CLASSES_LEX = sorted(CLASSES)   # ['away', 'draw', 'home']
 
 
 # ──────────────────────────────────────────────────────────
@@ -52,7 +56,10 @@ CLASSES    = ["home", "draw", "away"]
 # ──────────────────────────────────────────────────────────
 
 def rps(y_true: np.ndarray, probs: np.ndarray) -> float:
-    """Ranked Probability Score (menor es mejor)."""
+    """Ranked Probability Score (menor es mejor).
+
+    probs debe tener columnas en el orden de CLASSES = ['home','draw','away'].
+    """
     n = probs.shape[0]
     if n == 0:
         return float("nan")
@@ -65,6 +72,17 @@ def rps(y_true: np.ndarray, probs: np.ndarray) -> float:
         cum_true = np.cumsum(one_hot)
         total += np.sum((cum_pred - cum_true) ** 2) / 2
     return total / n
+
+
+def _reorder_probs(model, probs: np.ndarray) -> np.ndarray:
+    """Reordena columnas de probs al orden canonico de CLASSES.
+
+    sklearn devuelve probabilidades en orden alfabetico de model.classes_.
+    Esta funcion las remapea a ['home','draw','away'] para RPS y log_loss.
+    """
+    classes: List[str] = list(model.classes_)
+    col_order = [classes.index(c) for c in CLASSES]
+    return probs[:, col_order]
 
 
 # ──────────────────────────────────────────────────────────
@@ -99,12 +117,18 @@ def baseline_probs(train: pd.DataFrame, n: int) -> np.ndarray:
 # ──────────────────────────────────────────────────────────
 
 def train_lgbm(train: pd.DataFrame) -> LGBMClassifier:
+    """LightGBM con hiperparametros conservadores para mejor calibracion.
+
+    Reducimos complejidad (num_leaves=15, min_child_samples=20) respecto
+    al baseline anterior que daba log_loss=1.80 por exceso de confianza.
+    """
     X = train[FEATURE_COLS].fillna(0)
     y = train[TARGET_COL]
     model = LGBMClassifier(
-        n_estimators=300,
+        n_estimators=200,
         learning_rate=0.05,
-        num_leaves=31,
+        num_leaves=15,
+        min_child_samples=20,
         class_weight="balanced",
         random_state=42,
         verbose=-1,
@@ -113,12 +137,25 @@ def train_lgbm(train: pd.DataFrame) -> LGBMClassifier:
     return model
 
 
-def train_logistic(train: pd.DataFrame) -> LogisticRegression:
+def train_logistic(train: pd.DataFrame) -> Pipeline:
+    """Logistic Regression con StandardScaler (lbfgs requiere features escaladas).
+
+    Pipeline(scaler + LR) evita ConvergenceWarning y mejora la calibracion
+    de probabilidades, especialmente util cuando ELO (~1500) y rest_days (~7)
+    tienen escalas muy diferentes.
+    """
     X = train[FEATURE_COLS].fillna(0)
     y = train[TARGET_COL]
-    model = LogisticRegression(max_iter=500, class_weight="balanced", random_state=42)
-    model.fit(X, y)
-    return model
+    pipeline = Pipeline([
+        ("scaler", StandardScaler()),
+        ("lr", LogisticRegression(
+            max_iter=1000,
+            class_weight="balanced",
+            random_state=42,
+        )),
+    ])
+    pipeline.fit(X, y)
+    return pipeline
 
 
 # ──────────────────────────────────────────────────────────
@@ -130,12 +167,16 @@ def evaluate(
 ) -> Dict[str, float]:
     X = df[FEATURE_COLS].fillna(0)
     y = df[TARGET_COL].values
-    probs = model.predict_proba(X)
-    col_order = [list(model.classes_).index(c) for c in CLASSES]
-    probs = probs[:, col_order]
+    raw_probs = model.predict_proba(X)
+    probs = _reorder_probs(model, raw_probs)   # orden canonico: ['home','draw','away']
+
+    # log_loss requiere orden lexicografico: ['away','draw','home']
+    lex_order = [CLASSES.index(c) for c in _CLASSES_LEX]
+    probs_lex = probs[:, lex_order]
+
     metrics = {
         "rps":      rps(y, probs),
-        "log_loss": log_loss(y, probs, labels=CLASSES),
+        "log_loss": log_loss(y, probs_lex, labels=_CLASSES_LEX),
     }
     logger.info("%s metrics: %s", split_name, metrics)
     return metrics
@@ -151,7 +192,6 @@ def run(
     train_end_week: int = 25,
     val_end_week:   int = 30,
 ) -> Dict:
-    # Solo eliminamos filas sin target; los NULLs en features los gestiona fillna(0)
     df = features_df.dropna(subset=[TARGET_COL])
     train, val, test = temporal_split(df, train_end_week, val_end_week)
 
@@ -167,15 +207,15 @@ def run(
     base_rps   = rps(val[TARGET_COL].values, base_probs)
     logger.info("Baseline RPS (val): %.4f", base_rps)
 
-    # Logistic regression
+    # Logistic regression (Pipeline con StandardScaler)
     lr = train_logistic(train)
     lr_metrics = evaluate(lr, val, "logistic_val")
 
-    # LightGBM
+    # LightGBM (hiperparametros conservadores)
     lgbm = train_lgbm(train)
     lgbm_metrics = evaluate(lgbm, val, "lgbm_val")
 
-    # Test final solo con el mejor
+    # Test final con el mejor modelo segun RPS en val
     best_model = lgbm if lgbm_metrics["rps"] <= lr_metrics["rps"] else lr
     test_metrics = evaluate(best_model, test, "test") if not test.empty else {}
 
@@ -183,7 +223,11 @@ def run(
     Path(output_dir).mkdir(exist_ok=True)
     model_path = Path(output_dir) / "lgbm_v1.pkl"
     with open(model_path, "wb") as f:
-        pickle.dump({"model": best_model, "feature_cols": FEATURE_COLS, "classes": CLASSES}, f)
+        pickle.dump({
+            "model":        best_model,
+            "feature_cols": FEATURE_COLS,
+            "classes":      CLASSES,
+        }, f)
     logger.info("Model saved to %s", model_path)
 
     return {
