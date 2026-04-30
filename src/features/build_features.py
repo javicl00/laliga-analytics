@@ -144,6 +144,7 @@ class FeatureBuilder:
     def build(self) -> pd.DataFrame:
         """Devuelve DataFrame con una fila por partido y columnas de features."""
         self.matches = self.matches.sort_values("kickoff_at").reset_index(drop=True)
+        self.matches["kickoff_at"] = pd.to_datetime(self.matches["kickoff_at"], utc=True)
         rows: List[Dict] = []
 
         for _, match in self.matches.iterrows():
@@ -171,7 +172,7 @@ class FeatureBuilder:
             # Forma reciente en partidos
             feats.update(self._form_features(home_id, away_id, match_id))
 
-            # Descanso
+            # Descanso (filtrado estrictamente antes del kickoff actual)
             feats.update(self._rest_features(home_id, away_id, match["kickoff_at"]))
 
             # Presión competitiva
@@ -243,23 +244,28 @@ class FeatureBuilder:
             "away_goals_against_last5": last_n_goals_against(away_id, as_home=False),
         }
 
-    def _rest_features(self, home_id: int, away_id: int, kickoff) -> Dict:
-        """Días de descanso desde el último partido de cada equipo."""
+    def _rest_features(self, home_id: int, away_id: int, kickoff: pd.Timestamp) -> Dict:
+        """Días de descanso desde el último partido ANTES del kickoff actual.
+
+        Filtra estrictamente kickoff_at < kickoff para evitar que partidos
+        futuros o el propio partido contaminen el cálculo (anti-leakage).
+        """
+        kickoff_ts = pd.to_datetime(kickoff, utc=True)
         played = self.matches[
-            self.matches["status"].isin(_FINISHED_STATUSES)
+            self.matches["status"].isin(_FINISHED_STATUSES) &
+            (pd.to_datetime(self.matches["kickoff_at"], utc=True) < kickoff_ts)
         ]
 
-        def rest_days(team_id) -> float:
+        def rest_days(team_id: int) -> float:
             team_matches = played[
                 (played["home_team_id"] == team_id) | (played["away_team_id"] == team_id)
             ]
             if team_matches.empty:
                 return np.nan
-            last = pd.to_datetime(team_matches["kickoff_at"]).max()
-            k = pd.to_datetime(kickoff)
-            if pd.isna(last) or pd.isna(k):
+            last = pd.to_datetime(team_matches["kickoff_at"], utc=True).max()
+            if pd.isna(last):
                 return np.nan
-            return float((k - last).days)
+            return float((kickoff_ts - last).days)
 
         return {
             "home_rest_days": rest_days(home_id),
@@ -279,7 +285,6 @@ class FeatureBuilder:
             if row.empty:
                 return np.nan
             pos = float(row["position"].iloc[0])
-            # Alta presión si está en zona descenso (16-20) o lucha por título (1-4)
             if pos >= 16:
                 return float(remaining) / (remaining + 1.0) * (pos / 20.0)
             elif pos <= 4:

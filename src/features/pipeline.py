@@ -13,7 +13,9 @@ Procesa todos los partidos (con y sin resultado) para soportar inferencia.
 from __future__ import annotations
 
 import logging
+import math
 import os
+from typing import Any, Dict, List
 
 import pandas as pd
 from sqlalchemy import create_engine, text
@@ -22,6 +24,21 @@ from src.features.build_features import FeatureBuilder, FEATURE_COLUMNS
 from src.storage.repository import PostgresRawRepository
 
 logger = logging.getLogger(__name__)
+
+
+def _sanitize(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Convierte float NaN/Inf a None para compatibilidad con psycopg2.
+
+    psycopg2 no puede castear float('nan') a SMALLINT ni NUMERIC,
+    lanzando NumericValueOutOfRange. None se mapea correctamente a NULL.
+    """
+    result = {}
+    for k, v in row.items():
+        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+            result[k] = None
+        else:
+            result[k] = v
+    return result
 
 
 def run(season_id: int | None = None, db_url: str | None = None) -> None:
@@ -50,7 +67,10 @@ def run(season_id: int | None = None, db_url: str | None = None) -> None:
     logger.info("Computed features for %d matches", len(features_df))
 
     cols = ["match_id"] + FEATURE_COLUMNS
-    rows = features_df[cols].to_dict(orient="records")
+    rows: List[Dict] = [
+        _sanitize(r)
+        for r in features_df[cols].to_dict(orient="records")
+    ]
     repo.upsert_match_features(rows)
     logger.info("Feature pipeline complete")
 
