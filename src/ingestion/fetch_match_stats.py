@@ -91,6 +91,13 @@ def _resolve_is_home(
 
 
 def _upsert_stat(conn, match_id: int, is_home: bool, opta_team_id: str, stats: Dict) -> None:
+    """Inserta o actualiza una fila en match_stats_opta.
+
+    Claves de la API (todas snake_case):
+      possession_percentage, ppda, ontarget_scoring_att, total_scoring_att,
+      big_chance_created, big_chance_missed, accurate_pass, total_pass,
+      aerial_won, aerial_lost
+    """
     s = stats
     conn.execute(text("""
         INSERT INTO match_stats_opta (
@@ -109,32 +116,32 @@ def _upsert_stat(conn, match_id: int, is_home: bool, opta_team_id: str, stats: D
             :aerial_won, :aerial_lost
         )
         ON CONFLICT (match_id, is_home) DO UPDATE SET
-            opta_team_id      = EXCLUDED.opta_team_id,
-            possession_pct    = EXCLUDED.possession_pct,
-            ppda              = EXCLUDED.ppda,
-            shots_on_target   = EXCLUDED.shots_on_target,
-            total_shots       = EXCLUDED.total_shots,
+            opta_team_id        = EXCLUDED.opta_team_id,
+            possession_pct      = EXCLUDED.possession_pct,
+            ppda                = EXCLUDED.ppda,
+            shots_on_target     = EXCLUDED.shots_on_target,
+            total_shots         = EXCLUDED.total_shots,
             big_chances_created = EXCLUDED.big_chances_created,
             big_chances_missed  = EXCLUDED.big_chances_missed,
-            accurate_pass     = EXCLUDED.accurate_pass,
-            total_pass        = EXCLUDED.total_pass,
-            aerial_won        = EXCLUDED.aerial_won,
-            aerial_lost       = EXCLUDED.aerial_lost,
-            fetched_at        = now()
+            accurate_pass       = EXCLUDED.accurate_pass,
+            total_pass          = EXCLUDED.total_pass,
+            aerial_won          = EXCLUDED.aerial_won,
+            aerial_lost         = EXCLUDED.aerial_lost,
+            fetched_at          = now()
     """), {
-        "match_id":   match_id,
-        "is_home":    is_home,
-        "opta_team_id": opta_team_id,
-        "possession_pct":      s.get("possession_percentage"),
-        "ppda":                s.get("ppda"),
-        "shots_on_target":     s.get("ontargetscoringatt") or s.get("shots_on_target"),
-        "total_shots":         s.get("totalscoringatt") or s.get("total_scoring_att"),
-        "big_chances_created": s.get("bigchancecreated") or s.get("big_chance_created"),
-        "big_chances_missed":  s.get("bigchancemissed") or s.get("big_chance_missed"),
-        "accurate_pass":       s.get("accuratepass") or s.get("accurate_pass"),
-        "total_pass":          s.get("totalpass") or s.get("total_pass"),
-        "aerial_won":          s.get("aerialwon") or s.get("aerial_won"),
-        "aerial_lost":         s.get("aeriallost") or s.get("aerial_lost"),
+        "match_id":             match_id,
+        "is_home":              is_home,
+        "opta_team_id":         opta_team_id,
+        "possession_pct":       s.get("possession_percentage"),
+        "ppda":                 s.get("ppda"),
+        "shots_on_target":      s.get("ontarget_scoring_att"),
+        "total_shots":          s.get("total_scoring_att"),
+        "big_chances_created":  s.get("big_chance_created"),
+        "big_chances_missed":   s.get("big_chance_missed"),
+        "accurate_pass":        s.get("accurate_pass"),
+        "total_pass":           s.get("total_pass"),
+        "aerial_won":           s.get("aerial_won"),
+        "aerial_lost":          s.get("aerial_lost"),
     })
 
 
@@ -152,7 +159,6 @@ def run(
         match_id:  si se especifica, solo ese partido.
         force:     si True, re-ingesta aunque ya existan datos.
     """
-    # Construir query de partidos a procesar
     where_clauses = [
         "m.opta_id IS NOT NULL",
         "m.competition_main = TRUE",
@@ -167,7 +173,6 @@ def run(
         where_clauses.append("m.match_id = :match_id")
         params["match_id"] = match_id
     if not force:
-        # Solo partidos sin las dos filas home+away en match_stats_opta
         where_clauses.append("""
             (SELECT COUNT(*) FROM match_stats_opta mso WHERE mso.match_id = m.match_id) < 2
         """)
@@ -197,10 +202,10 @@ def run(
     ok = not_found = error = 0
 
     for row in rows:
-        mid        = row.match_id
-        opta_id    = row.opta_id          # 'g2572229'
-        home_opta  = row.home_opta_team_id  # 't184'
-        away_opta  = row.away_opta_team_id  # 't954'
+        mid       = row.match_id
+        opta_id   = row.opta_id
+        home_opta = row.home_opta_team_id
+        away_opta = row.away_opta_team_id
 
         team_stats = fetch_stats(opta_id, session)
         time.sleep(_RATE_LIMIT_S)
@@ -222,7 +227,6 @@ def run(
                     is_home = _resolve_is_home(ot_id, home_opta, away_opta)
 
                     if is_home is None:
-                        # Fallback: asignar por orden (primer entry = home)
                         is_home = (team_stats.index(entry) == 0)
                         logger.debug(
                             "match %d: no se pudo resolver is_home para %s, fallback=%s",
