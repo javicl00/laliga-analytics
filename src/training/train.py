@@ -8,13 +8,13 @@ Validacion walk-forward por temporada (sin data leakage temporal):
 Metrica principal: RPS (Ranked Probability Score).
 El modelo entrenado se guarda en models/lgbm_v1.pkl.
 
-Features activas (22 columnas):
-  D - ELO:         home_elo, away_elo, elo_diff
+Features activas (18 columnas tras pruning):
+  D - ELO:         elo_diff                         (home_elo/away_elo eliminados: redundantes)
   A - Standings:   home/away_points_total, home/away_table_position,
-                   position_diff, home/away_gd_total
+                   home/away_gd_total               (position_diff eliminado: redundante)
   B - Forma:       home/away_goals_for/against_last5
   E - Contexto:    home_rest_days, away_rest_days,
-                   home/away_pressure_index, gameweek
+                   home_pressure_index, gameweek    (away_pressure_index eliminado: ruido)
   F - H2H:         h2h_home_wins, h2h_draws, h2h_away_wins
 """
 from __future__ import annotations
@@ -36,24 +36,26 @@ from sklearn.preprocessing import StandardScaler
 logger = logging.getLogger(__name__)
 
 FEATURE_COLS = [
-    # D: ELO dinamico
-    "home_elo", "away_elo", "elo_diff",
+    # D: ELO (solo diferencial; home/away absolutos son redundantes con standings)
+    "elo_diff",
     # A: Estado competitivo
     "home_points_total", "away_points_total",
-    "home_table_position", "away_table_position", "position_diff",
+    "home_table_position", "away_table_position",
+    # position_diff eliminado: linealmente redundante con home/away_table_position
     "home_gd_total", "away_gd_total",
     # B: Forma reciente (ultimos 5, todos los campos)
     "home_goals_for_last5",   "home_goals_against_last5",
     "away_goals_for_last5",   "away_goals_against_last5",
     # E: Contexto
     "home_rest_days", "away_rest_days",
-    "home_pressure_index", "away_pressure_index",
+    "home_pressure_index",
+    # away_pressure_index eliminado: coef 2.6%, ruido
     "gameweek",
     # F: Head-to-Head
     "h2h_home_wins", "h2h_draws", "h2h_away_wins",
 ]
-TARGET_COL  = "result"   # home | draw | away
-CLASSES     = ["home", "draw", "away"]
+TARGET_COL   = "result"   # home | draw | away
+CLASSES      = ["home", "draw", "away"]
 _CLASSES_LEX = sorted(CLASSES)   # ['away', 'draw', 'home']
 
 
@@ -71,9 +73,7 @@ def rps(y_true: np.ndarray, probs: np.ndarray) -> float:
         true_idx = CLASSES.index(y_true[i])
         one_hot  = np.zeros(3)
         one_hot[true_idx] = 1.0
-        cum_pred = np.cumsum(probs[i])
-        cum_true = np.cumsum(one_hot)
-        total += np.sum((cum_pred - cum_true) ** 2) / 2
+        total += np.sum((np.cumsum(probs[i]) - np.cumsum(one_hot)) ** 2) / 2
     return total / n
 
 
@@ -94,14 +94,12 @@ def temporal_split(
     """Walk-forward split por temporada completa.
 
     Por defecto: test=ultima temporada, val=penultima, train=el resto.
-    Evita la contaminacion del split anterior que mezclaba jornadas
-    de distintas temporadas al filtrar por gameweek_week.
     """
     seasons = sorted(df["season_id"].dropna().unique().tolist())
     logger.info("Temporadas disponibles: %s", seasons)
 
     if len(seasons) < 2:
-        raise ValueError(f"Se necesitan al menos 2 temporadas completas, hay {len(seasons)}")
+        raise ValueError(f"Se necesitan al menos 2 temporadas, hay {len(seasons)}")
 
     if test_season is None:
         test_season = seasons[-1]
@@ -115,9 +113,7 @@ def temporal_split(
 
     logger.info(
         "Split: train=%d (T:%s) | val=%d (T:%s) | test=%d (T:%s)",
-        len(train), train_seasons,
-        len(val),   val_season,
-        len(test),  test_season,
+        len(train), train_seasons, len(val), val_season, len(test), test_season,
     )
     return train, val, test
 
@@ -165,8 +161,8 @@ def train_logistic(train: pd.DataFrame) -> Pipeline:
 # ──────────────────────────────────────────────────────────
 
 def evaluate(model, df: pd.DataFrame, split_name: str = "val") -> Dict[str, float]:
-    X = df[FEATURE_COLS].fillna(0)
-    y = df[TARGET_COL].values
+    X         = df[FEATURE_COLS].fillna(0)
+    y         = df[TARGET_COL].values
     probs     = _reorder_probs(model, model.predict_proba(X))
     probs_lex = probs[:, [CLASSES.index(c) for c in _CLASSES_LEX]]
     metrics   = {
@@ -192,16 +188,14 @@ def run(
 
     if train.empty or val.empty:
         raise ValueError(
-            f"Split insuficiente: train={len(train)} val={len(val)}. "
-            "Necesitas al menos 2 temporadas con result IS NOT NULL."
+            f"Split insuficiente: train={len(train)} val={len(val)}."
         )
 
     base_rps = rps(val[TARGET_COL].values, baseline_probs(train, len(val)))
     logger.info("Baseline RPS (val): %.4f", base_rps)
 
-    lr          = train_logistic(train)
-    lr_metrics  = evaluate(lr, val, "logistic_val")
-
+    lr           = train_logistic(train)
+    lr_metrics   = evaluate(lr, val, "logistic_val")
     lgbm         = train_lgbm(train)
     lgbm_metrics = evaluate(lgbm, val, "lgbm_val")
 
@@ -211,7 +205,11 @@ def run(
     Path(output_dir).mkdir(exist_ok=True)
     model_path = Path(output_dir) / "lgbm_v1.pkl"
     with open(model_path, "wb") as f:
-        pickle.dump({"model": best_model, "feature_cols": FEATURE_COLS, "classes": CLASSES}, f)
+        pickle.dump({
+            "model":        best_model,
+            "feature_cols": FEATURE_COLS,
+            "classes":      CLASSES,
+        }, f)
     logger.info("Model saved to %s", model_path)
 
     return {
@@ -230,14 +228,14 @@ if __name__ == "__main__":
     with engine.connect() as conn:
         matches = pd.read_sql(sqlt(
             "SELECT m.match_id, m.season_id, m.gameweek_week, m.result, "
-            "f.home_elo, f.away_elo, f.elo_diff, "
+            "f.elo_diff, "
             "f.home_points_total, f.away_points_total, "
-            "f.home_table_position, f.away_table_position, f.position_diff, "
+            "f.home_table_position, f.away_table_position, "
             "f.home_gd_total, f.away_gd_total, "
             "f.home_goals_for_last5, f.home_goals_against_last5, "
             "f.away_goals_for_last5, f.away_goals_against_last5, "
             "f.home_rest_days, f.away_rest_days, "
-            "f.home_pressure_index, f.away_pressure_index, "
+            "f.home_pressure_index, "
             "f.gameweek, f.h2h_home_wins, f.h2h_draws, f.h2h_away_wins "
             "FROM matches m "
             "JOIN match_features f USING (match_id) "
