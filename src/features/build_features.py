@@ -3,14 +3,15 @@
 Todas las features son calculadas con datos disponibles
 EXCLUSIVAMENTE antes del kickoff del partido objetivo.
 
-Familias de features (22 activas):
+Familias de features (24 activas):
   A - Estado competitivo (standings prepartido desde historial):
       home/away_points_total, home/away_table_position,
       position_diff, home/away_gd_total
   B - Forma reciente (ultimos 5 partidos de cualquier campo):
       home/away_goals_for/against_last5
   D - ELO dinamico:
-      home_elo, away_elo, elo_diff
+      home_elo, away_elo, elo_diff,
+      home_elo_momentum, away_elo_momentum  (delta ELO ultimos ELO_MOMENTUM_WINDOW partidos)
   E - Contexto:
       gameweek, home/away_rest_days, home/away_pressure_index
   F - Head-to-Head (ultimos 10 enfrentamientos directos):
@@ -28,12 +29,13 @@ from src.features.standings_builder import build_match_standings
 
 logger = logging.getLogger(__name__)
 
-FEATURE_VERSION = "v2.1.0"
+FEATURE_VERSION = "v2.2.0"
 
 _HOME_SCORE = "home_score"
 _AWAY_SCORE = "away_score"
 _FINISHED_STATUSES = {"FinishedPeriod", "FullTime", "Finished"}
 H2H_WINDOW = 10
+ELO_MOMENTUM_WINDOW = 5  # partidos hacia atras para calcular delta ELO
 
 
 # ---------------------------------------------------------------------------
@@ -41,13 +43,20 @@ H2H_WINDOW = 10
 # ---------------------------------------------------------------------------
 
 class EloRating:
-    """Ratings Elo dinamicos por equipo con factores home/away."""
+    """Ratings Elo dinamicos por equipo con factores home/away.
+
+    Ademas del rating actual, rastrea el historial de ratings por equipo
+    para calcular momentum (variacion en los ultimos N partidos jugados).
+    """
 
     def __init__(self, base: float = 1500.0, k: float = 32.0, home_advantage: float = 70.0) -> None:
         self.base = base
         self.k = k
         self.home_advantage = home_advantage
         self.ratings: Dict[int, float] = {}
+        # historial de ratings POR EQUIPO en orden cronologico
+        # cada entrada = rating ANTES de jugar ese partido
+        self._history: Dict[int, List[float]] = {}
 
     def _get(self, team_id: int) -> float:
         return self.ratings.get(team_id, self.base)
@@ -59,11 +68,27 @@ class EloRating:
         return p_home, 1.0 - p_home
 
     def update(self, home_id: int, away_id: int, home_score: int, away_score: int) -> None:
+        # Guardar rating ANTES del partido en el historial de cada equipo
+        self._history.setdefault(home_id, []).append(self._get(home_id))
+        self._history.setdefault(away_id, []).append(self._get(away_id))
+
         p_home, p_away = self.expected(home_id, away_id)
         s_home, s_away = (1.0, 0.0) if home_score > away_score else \
                          (0.0, 1.0) if home_score < away_score else (0.5, 0.5)
         self.ratings[home_id] = self._get(home_id) + self.k * (s_home - p_home)
         self.ratings[away_id] = self._get(away_id) + self.k * (s_away - p_away)
+
+    def momentum(self, team_id: int, n: int = ELO_MOMENTUM_WINDOW) -> float:
+        """Delta ELO = rating_actual - rating_hace_n_partidos.
+
+        Positivo: el equipo ha ganado nivel en los ultimos n partidos.
+        Negativo: ha perdido nivel.
+        NaN si el equipo tiene menos de n partidos en historial.
+        """
+        history = self._history.get(team_id, [])
+        if len(history) < n:
+            return float("nan")
+        return self._get(team_id) - history[-n]
 
     def snapshot(self) -> Dict[int, float]:
         return dict(self.ratings)
@@ -74,7 +99,7 @@ class EloRating:
 # ---------------------------------------------------------------------------
 
 class FeatureBuilder:
-    """Construye el dataset de features prepartido libre de leakage (22 features).
+    """Construye el dataset de features prepartido libre de leakage (24 features).
 
     Los standings se computan internamente desde el historial de resultados.
     No se requieren datos externos.
@@ -108,15 +133,19 @@ class FeatureBuilder:
             away_id  = int(match["away_team_id"])
 
             feats: Dict = {
-                "match_id":     match_id,
-                "season_id":    match.get("season_id"),
-                "gameweek":     match.get("gameweek_week", -1),
-                "kickoff_at":   match.get("kickoff_at"),
-                "home_team_id": home_id,
-                "away_team_id": away_id,
-                "home_elo":     self._elo._get(home_id),
-                "away_elo":     self._elo._get(away_id),
-                "elo_diff":     self._elo._get(home_id) - self._elo._get(away_id),
+                "match_id":          match_id,
+                "season_id":         match.get("season_id"),
+                "gameweek":          match.get("gameweek_week", -1),
+                "kickoff_at":        match.get("kickoff_at"),
+                "home_team_id":      home_id,
+                "away_team_id":      away_id,
+                "home_elo":          self._elo._get(home_id),
+                "away_elo":          self._elo._get(away_id),
+                "elo_diff":          self._elo._get(home_id) - self._elo._get(away_id),
+                # Momentum: delta ELO en los ultimos ELO_MOMENTUM_WINDOW partidos
+                # Se calcula ANTES de actualizar ELO con el resultado de este partido
+                "home_elo_momentum": self._elo.momentum(home_id),
+                "away_elo_momentum": self._elo.momentum(away_id),
             }
             feats.update(self._standing_features(match_id, home_id, away_id, int(match.get("gameweek_week", 1) or 1)))
             feats.update(self._form_features(home_id, away_id, match_id))
@@ -127,6 +156,7 @@ class FeatureBuilder:
             home_score = match.get(_HOME_SCORE)
             away_score = match.get(_AWAY_SCORE)
             if pd.notna(home_score) and pd.notna(away_score):
+                # update() registra el rating actual en _history ANTES de actualizar
                 self._elo.update(home_id, away_id, int(home_score), int(away_score))
 
         return pd.DataFrame(rows)
@@ -156,11 +186,7 @@ class FeatureBuilder:
         ]}
 
     def _form_features(self, home_id: int, away_id: int, current_match_id: int) -> Dict:
-        """Forma reciente: goles en los ultimos 5 partidos de CUALQUIER campo.
-
-        Corrige el bug anterior que solo contabilizaba partidos en casa para
-        el local y partidos fuera para el visitante.
-        """
+        """Forma reciente: goles en los ultimos 5 partidos de CUALQUIER campo."""
         played = self.matches[
             (self.matches["match_id"] < current_match_id) &
             (self.matches["status"].isin(_FINISHED_STATUSES))
@@ -211,10 +237,7 @@ class FeatureBuilder:
         return {"home_rest_days": rest_days(home_id), "away_rest_days": rest_days(away_id)}
 
     def _h2h_features(self, home_id: int, away_id: int, current_match_id: int) -> Dict:
-        """Historial directo: ultimos H2H_WINDOW enfrentamientos entre ambos equipos.
-
-        Perspectiva relativa al partido actual: home_id siempre es el 'local'.
-        """
+        """Historial directo: ultimos H2H_WINDOW enfrentamientos entre ambos equipos."""
         h2h = self.matches[
             (self.matches["match_id"] < current_match_id) &
             (self.matches["status"].isin(_FINISHED_STATUSES)) &
@@ -231,12 +254,10 @@ class FeatureBuilder:
         for _, r in h2h.iterrows():
             result = r.get("result")
             if r["home_team_id"] == home_id:
-                # home_id jugo como local en ese partido
-                if result == "home":  draws_ = False; home_wins += 1
+                if result == "home":  home_wins += 1
                 elif result == "draw": draws += 1
                 else: away_wins += 1
             else:
-                # home_id jugo como visitante en ese partido
                 if result == "away":  home_wins += 1
                 elif result == "draw": draws += 1
                 else: away_wins += 1
@@ -245,12 +266,13 @@ class FeatureBuilder:
 
 
 # ---------------------------------------------------------------------------
-# Columnas de features para entrenamiento (22 activas)
+# Columnas de features para entrenamiento (24 activas)
 # ---------------------------------------------------------------------------
 
 FEATURE_COLUMNS: List[str] = [
     # Familia D: ELO
     "home_elo", "away_elo", "elo_diff",
+    "home_elo_momentum", "away_elo_momentum",
     # Familia A: Estado competitivo
     "home_points_total", "away_points_total",
     "home_table_position", "away_table_position", "position_diff",

@@ -14,7 +14,7 @@ Seleccion de modelo:
   de features (determinado por cobertura en train, ver _available()).
 
 Features activas:
-  D - ELO:         elo_diff  (absolutos redundantes con standings en ELO cold-start)
+  D - ELO:         elo_diff, home_elo_momentum, away_elo_momentum
   A - Standings:   home/away_points_total, home/away_table_position,
                    home/away_gd_total
   B - Forma:       home/away_goals_for/against_last5
@@ -48,8 +48,9 @@ logger = logging.getLogger(__name__)
 OPTA_THRESHOLD = 0.10
 
 BASE_COLS = [
-    # D: ELO diferencial (absolutos redundantes con standings dado cold-start desde 1500)
+    # D: ELO
     "elo_diff",
+    "home_elo_momentum", "away_elo_momentum",
     # A: Estado competitivo
     "home_points_total", "away_points_total",
     "home_table_position", "away_table_position",
@@ -88,6 +89,10 @@ def _available(df: pd.DataFrame) -> List[str]:
     Incluye familia G (Opta) solo si su cobertura en df supera OPTA_THRESHOLD.
     Esto evita que LightGBM aprenda splits espurios sobre columnas 100% NaN
     cuando ningun partido del split tiene datos Opta.
+
+    home/away_elo_momentum pueden ser NaN para los primeros partidos de cada
+    equipo (< ELO_MOMENTUM_WINDOW partidos disputados); LightGBM los gestiona
+    de forma nativa y LogisticRegression los imputa con 0 via fillna.
     """
     base = [c for c in BASE_COLS if c in df.columns]
 
@@ -311,6 +316,7 @@ if __name__ == "__main__":
             SELECT
                 m.match_id, m.season_id, m.result,
                 f.elo_diff,
+                f.home_elo_momentum, f.away_elo_momentum,
                 f.home_points_total,    f.away_points_total,
                 f.home_table_position,  f.away_table_position,
                 f.home_gd_total,        f.away_gd_total,

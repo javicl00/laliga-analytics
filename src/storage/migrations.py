@@ -31,6 +31,9 @@ _REQUIRED_COLUMNS: List[Tuple[str, str, str]] = [
     ("match_features", "h2h_home_wins", "SMALLINT"),
     ("match_features", "h2h_draws",     "SMALLINT"),
     ("match_features", "h2h_away_wins", "SMALLINT"),
+    # Familia D: ELO momentum (migration 005)
+    ("match_features", "home_elo_momentum", "REAL"),
+    ("match_features", "away_elo_momentum", "REAL"),
 ]
 
 
@@ -44,7 +47,7 @@ def _existing_columns(engine: Engine, table: str) -> set:
 
 
 def _schema_guard(engine: Engine) -> None:
-    """Añade columnas criticas si no existen (safety net independiente de sql/)."""
+    """Aniade columnas criticas si no existen (safety net independiente de sql/)."""
     tables_checked: dict = {}
     for table, column, col_def in _REQUIRED_COLUMNS:
         if table not in tables_checked:
