@@ -18,7 +18,8 @@ Features activas (26 columnas):
   F - H2H:         h2h_home_wins, h2h_draws, h2h_away_wins
   G - Opta stats:  home/away_possession_last5, home/away_ppda_last5,
                    home/away_shots_ot_last5, home/away_bigchances_last5
-                   (NaN para temporadas sin opta_id -> imputado con 0)
+                   (NaN en temporadas sin opta_id: LightGBM los gestiona
+                   de forma nativa; LogisticRegression imputa con 0)
 """
 from __future__ import annotations
 
@@ -45,7 +46,7 @@ FEATURE_COLS = [
     "home_points_total", "away_points_total",
     "home_table_position", "away_table_position",
     "home_gd_total", "away_gd_total",
-    # B: Forma reciente (ultimos 5, todos los campos)
+    # B: Forma reciente (ultimos 5)
     "home_goals_for_last5",   "home_goals_against_last5",
     "away_goals_for_last5",   "away_goals_against_last5",
     # E: Contexto
@@ -54,8 +55,7 @@ FEATURE_COLS = [
     "gameweek",
     # F: Head-to-Head
     "h2h_home_wins", "h2h_draws", "h2h_away_wins",
-    # G: Opta rolling stats (disponibles para temporadas con opta_id)
-    # NaN en temporadas antiguas -> imputados con 0 via fillna
+    # G: Opta rolling stats (solo disponibles para temporadas con opta_id)
     "home_possession_last5", "away_possession_last5",
     "home_ppda_last5",       "away_ppda_last5",
     "home_shots_ot_last5",   "away_shots_ot_last5",
@@ -64,6 +64,25 @@ FEATURE_COLS = [
 TARGET_COL   = "result"
 CLASSES      = ["home", "draw", "away"]
 _CLASSES_LEX = sorted(CLASSES)
+
+
+# ──────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────
+
+def _available(df: pd.DataFrame) -> List[str]:
+    """Devuelve las columnas de FEATURE_COLS presentes en df."""
+    return [c for c in FEATURE_COLS if c in df.columns]
+
+
+def _X_lgbm(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    """Features para LightGBM: NaN nativo (no fillna)."""
+    return df[cols]
+
+
+def _X_sklearn(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    """Features para modelos sklearn: fillna(0) porque no toleran NaN."""
+    return df[cols].fillna(0)
 
 
 # ──────────────────────────────────────────────────────────
@@ -135,9 +154,9 @@ def baseline_probs(train: pd.DataFrame, n: int) -> np.ndarray:
 # ──────────────────────────────────────────────────────────
 
 def train_lgbm(train: pd.DataFrame) -> LGBMClassifier:
-    # Columnas disponibles (familia G puede estar ausente en datasets antiguos)
-    available_cols = [c for c in FEATURE_COLS if c in train.columns]
-    X = train[available_cols].fillna(0)
+    cols = _available(train)
+    # NaN nativo: LightGBM aprende la direccion optima de split para ausentes
+    X = _X_lgbm(train, cols)
     y = train[TARGET_COL]
     model = LGBMClassifier(
         n_estimators=200,
@@ -150,19 +169,19 @@ def train_lgbm(train: pd.DataFrame) -> LGBMClassifier:
         verbose=-1,
     )
     model.fit(X, y)
-    model._feature_cols_used = available_cols  # guardar para inference
+    model._feature_cols_used = cols
     return model
 
 
 def train_logistic(train: pd.DataFrame) -> Pipeline:
-    available_cols = [c for c in FEATURE_COLS if c in train.columns]
-    X = train[available_cols].fillna(0)
+    cols = _available(train)
+    X = _X_sklearn(train, cols)   # sklearn no tolera NaN
     y = train[TARGET_COL]
     pipe = Pipeline([
         ("scaler", StandardScaler()),
         ("lr", LogisticRegression(max_iter=1000, class_weight="balanced", random_state=42)),
     ]).fit(X, y)
-    pipe._feature_cols_used = available_cols
+    pipe._feature_cols_used = cols
     return pipe
 
 
@@ -171,10 +190,10 @@ def train_logistic(train: pd.DataFrame) -> Pipeline:
 # ──────────────────────────────────────────────────────────
 
 def evaluate(model, df: pd.DataFrame, split_name: str = "val") -> Dict[str, float]:
-    available_cols = getattr(model, "_feature_cols_used", FEATURE_COLS)
-    available_cols = [c for c in available_cols if c in df.columns]
-    X         = df[available_cols].fillna(0)
-    y         = df[TARGET_COL].values
+    cols  = [c for c in getattr(model, "_feature_cols_used", FEATURE_COLS) if c in df.columns]
+    is_lgbm = isinstance(model, LGBMClassifier)
+    X     = _X_lgbm(df, cols) if is_lgbm else _X_sklearn(df, cols)
+    y     = df[TARGET_COL].values
     probs     = _reorder_probs(model, model.predict_proba(X))
     probs_lex = probs[:, [CLASSES.index(c) for c in _CLASSES_LEX]]
     metrics   = {
