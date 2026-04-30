@@ -3,10 +3,14 @@
 Requiere que match_stats_opta este poblada por fetch_match_stats.py.
 
 Algoritmo vectorizado (O(n log n)):
-  1. Construye tabla long: (match_id, team_id, kickoff_at, is_home, stats...)
+  1. Construye tabla long desde TODOS los matches (home + away) con LEFT JOIN a stats
   2. Ordena por team_id + kickoff_at
-  3. groupby(team_id).shift(1).rolling(5).mean()  → rolling sin leakage
+  3. groupby(team_id).shift(1).rolling(5).mean() -> rolling sin leakage
+     shift(1) garantiza que el partido actual no entra en su propio calculo
   4. Pivot de vuelta a columnas home_ / away_ por match_id
+
+Nota: un partido sin stats propias PUEDE tener rolling features si el equipo
+tiene historial previo con stats -> se mantienen todos los partidos posibles.
 
 Features generadas (8 columnas):
   home/away_possession_last5  -- % posesion media ultimos 5
@@ -31,10 +35,10 @@ logger = logging.getLogger(__name__)
 ROLLING_N  = 5
 _STAT_COLS = ["possession_pct", "ppda", "shots_on_target", "big_chances_created"]
 _FEAT_MAP  = {
-    "possession_pct":    "possession_last5",
-    "ppda":              "ppda_last5",
-    "shots_on_target":   "shots_ot_last5",
-    "big_chances_created": "bigchances_last5",
+    "possession_pct":       "possession_last5",
+    "ppda":                 "ppda_last5",
+    "shots_on_target":      "shots_ot_last5",
+    "big_chances_created":  "bigchances_last5",
 }
 
 
@@ -54,29 +58,40 @@ def _load_data(engine) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def _build_team_long(matches: pd.DataFrame, stats: pd.DataFrame) -> pd.DataFrame:
-    """Construye tabla long: una fila por (partido, equipo) con sus stats."""
-    # Stats home
-    home_stats = stats[stats["is_home"]].merge(
-        matches[["match_id", "kickoff_at", "home_team_id"]],
-        on="match_id",
-    ).rename(columns={"home_team_id": "team_id"}).drop(columns="is_home")
+    """Tabla long con UNA fila por (partido, rol) para todos los matches.
 
-    # Stats away
-    away_stats = stats[~stats["is_home"]].merge(
-        matches[["match_id", "kickoff_at", "away_team_id"]],
-        on="match_id",
-    ).rename(columns={"away_team_id": "team_id"}).drop(columns="is_home")
+    LEFT JOIN a stats: partidos sin stats propias tienen NaN en stat_cols
+    pero siguen presentes para que el rolling funcione correctamente.
+    """
+    # Fila home para cada partido
+    home = matches[["match_id", "kickoff_at", "home_team_id"]].rename(
+        columns={"home_team_id": "team_id"}
+    ).assign(role="home")
 
-    long = pd.concat([home_stats, away_stats], ignore_index=True)
-    return long.sort_values(["team_id", "kickoff_at"]).reset_index(drop=True)
+    # Fila away para cada partido
+    away = matches[["match_id", "kickoff_at", "away_team_id"]].rename(
+        columns={"away_team_id": "team_id"}
+    ).assign(role="away")
+
+    long = pd.concat([home, away], ignore_index=True)
+
+    # LEFT JOIN a stats
+    stats_home = stats[stats["is_home"] == True].drop(columns="is_home")   # noqa: E712
+    stats_away = stats[stats["is_home"] == False].drop(columns="is_home")  # noqa: E712
+
+    long_home = long[long["role"] == "home"].merge(
+        stats_home, on="match_id", how="left"
+    )
+    long_away = long[long["role"] == "away"].merge(
+        stats_away, on="match_id", how="left"
+    )
+
+    result = pd.concat([long_home, long_away], ignore_index=True)
+    return result.sort_values(["team_id", "kickoff_at"]).reset_index(drop=True)
 
 
 def compute_opta_features(engine) -> pd.DataFrame:
-    """Devuelve DataFrame con match_id + 8 columnas familia G.
-
-    Usa shift(1) antes del rolling para garantizar que el partido actual
-    no entra en su propio calculo (sin leakage).
-    """
+    """Devuelve DataFrame con match_id + 8 columnas familia G."""
     matches, stats = _load_data(engine)
 
     if stats.empty:
@@ -85,66 +100,38 @@ def compute_opta_features(engine) -> pd.DataFrame:
 
     long = _build_team_long(matches, stats)
 
-    # Rolling avg ultimos N partidos ANTERIORES (shift(1) elimina el partido actual)
+    # Rolling avg: shift(1) excluye el partido actual, min_periods=1 evita NaN
+    # cuando hay menos de ROLLING_N partidos previos con stats
     rolled = (
         long
         .groupby("team_id", sort=False)[_STAT_COLS]
         .transform(lambda x: x.shift(1).rolling(ROLLING_N, min_periods=1).mean())
     )
-    long[[f"{c}_r" for c in _STAT_COLS]] = rolled
+    rolled_cols = {c: f"{c}_r" for c in _STAT_COLS}
+    long = long.join(rolled.rename(columns=rolled_cols))
 
-    rolled_cols = [f"{c}_r" for c in _STAT_COLS]
-
-    # Join rolling stats al DataFrame de partidos para home y away
-    home_rolled = long[["match_id"] + rolled_cols].merge(
-        matches[["match_id", "home_team_id"]],
-        on="match_id",
-    )
-    # Puede haber duplicados si un equipo aparece varias veces; nos quedamos
-    # con el registro home del partido correcto
-    home_stats_full = stats[stats["is_home"]].merge(
-        matches[["match_id", "home_team_id", "kickoff_at"]],
-        on="match_id",
-    ).rename(columns={"home_team_id": "team_id"})
-
-    away_stats_full = stats[~stats["is_home"]].merge(
-        matches[["match_id", "away_team_id", "kickoff_at"]],
-        on="match_id",
-    ).rename(columns={"away_team_id": "team_id"})
-
-    long2 = pd.concat(
-        [home_stats_full.assign(role="home"), away_stats_full.assign(role="away")],
-        ignore_index=True,
-    ).sort_values(["team_id", "kickoff_at"]).reset_index(drop=True)
-
-    rolled2 = (
-        long2
-        .groupby("team_id", sort=False)[_STAT_COLS]
-        .transform(lambda x: x.shift(1).rolling(ROLLING_N, min_periods=1).mean())
-    )
-    long2[[f"{c}_r" for c in _STAT_COLS]] = rolled2
-
-    home_part = long2[long2["role"] == "home"][["match_id"] + rolled_cols].copy()
-    home_part.columns = ["match_id"] + [f"home_{_FEAT_MAP[c.rstrip('_r').replace('_r','')]}"
-                                         if c != "match_id" else c
-                                         for c in rolled_cols]
-
-    away_part = long2[long2["role"] == "away"][["match_id"] + rolled_cols].copy()
-    away_part.columns = ["match_id"] + [f"away_{_FEAT_MAP[c.rstrip('_r').replace('_r','')]}"
-                                         if c != "match_id" else c
-                                         for c in rolled_cols]
-
-    # Renombrar correctamente
+    # Separar home y away con sus rolling features
     home_rename = {f"{c}_r": f"home_{_FEAT_MAP[c]}" for c in _STAT_COLS}
     away_rename = {f"{c}_r": f"away_{_FEAT_MAP[c]}" for c in _STAT_COLS}
 
-    home_part = long2[long2["role"] == "home"][["match_id"] + rolled_cols].rename(columns=home_rename)
-    away_part = long2[long2["role"] == "away"][["match_id"] + rolled_cols].rename(columns=away_rename)
+    rcols = list(rolled_cols.values())  # ['possession_pct_r', ...]
 
-    result = matches[["match_id"]].merge(home_part, on="match_id", how="left") \
-                                  .merge(away_part,  on="match_id", how="left")
+    home_part = (
+        long[long["role"] == "home"][["match_id"] + rcols]
+        .rename(columns=home_rename)
+    )
+    away_part = (
+        long[long["role"] == "away"][["match_id"] + rcols]
+        .rename(columns=away_rename)
+    )
 
-    # Filtrar partidos donde todo es NaN (sin historial Opta)
+    result = (
+        matches[["match_id"]]
+        .merge(home_part, on="match_id", how="left")
+        .merge(away_part,  on="match_id", how="left")
+    )
+
+    # Descartar partidos donde TODOS los valores son NaN (sin historial Opta)
     feat_cols = list(home_rename.values()) + list(away_rename.values())
     result = result.dropna(subset=feat_cols, how="all")
 
@@ -153,7 +140,7 @@ def compute_opta_features(engine) -> pd.DataFrame:
 
 
 def write_to_db(df: pd.DataFrame, engine) -> None:
-    """Escribe las features en match_features via UPDATE con executemany."""
+    """Escribe las features en match_features via UPDATE (executemany)."""
     if df.empty:
         logger.warning("DataFrame vacio, nada que escribir")
         return
@@ -164,7 +151,6 @@ def write_to_db(df: pd.DataFrame, engine) -> None:
         "home_shots_ot_last5",   "away_shots_ot_last5",
         "home_bigchances_last5", "away_bigchances_last5",
     ]
-    # Asegurar que existen todas las columnas (pueden faltar si no hay stats)
     for col in feat_cols:
         if col not in df.columns:
             df[col] = None
@@ -184,7 +170,7 @@ def write_to_db(df: pd.DataFrame, engine) -> None:
 
     records = df[["match_id"] + feat_cols].to_dict(orient="records")
     with engine.begin() as conn:
-        conn.execute(update_sql, records)   # executemany automatico
+        conn.execute(update_sql, records)
 
     logger.info("match_features actualizado para %d partidos", len(df))
 
