@@ -7,11 +7,19 @@ Lee los payloads JSON de raw_snapshots y puebla:
   - matches
   - standings
 
+Fixes respecto a v1:
+  - Procesa TODAS las temporadas (antes rompia con break en la primera).
+  - Extrae equipos tambien de los payloads de partidos para evitar
+    FK violations con equipos no presentes en subscription.teams
+    (equipos ascendidos/descendidos entre temporadas).
+
 Uso:
     python -m src.normalize.run_normalize
+    python -m src.normalize.run_normalize --season 2015   # solo una temporada
 """
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
@@ -63,8 +71,11 @@ def parse_subscription(payload: Any) -> Dict:
     teams_raw = sub.get("teams") or []
     teams = []
     for t in teams_raw:
+        tid = _int(t.get("id"))
+        if not tid:
+            continue
         teams.append({
-            "team_id":   _int(t.get("id")),
+            "team_id":   tid,
             "slug":      t.get("slug", ""),
             "name":      t.get("name") or t.get("nickname") or "",
             "shortname": t.get("shortname") or t.get("nickname"),
@@ -73,7 +84,6 @@ def parse_subscription(payload: Any) -> Dict:
             "lde_id":    _int(t.get("lde_id")),
         })
 
-    # Gameweeks desde subscription (puede ser incompleto)
     gameweeks_raw = sub.get("gameweeks") or sub.get("rounds") or []
     gameweeks = []
     for gw in gameweeks_raw:
@@ -89,13 +99,36 @@ def parse_subscription(payload: Any) -> Dict:
     return {"season": season, "teams": teams, "gameweeks": gameweeks}
 
 
-def extract_gameweeks_from_matches(snapshots, season_id: int) -> List[Dict]:
-    """Extrae gameweeks unicos embebidos en los payloads de partidos.
+def extract_teams_from_matches(snapshots: List[Dict]) -> List[Dict]:
+    """Extrae equipos de los payloads de partidos como fallback.
 
-    Cada partido tiene un campo 'gameweek': {id, week, name, ...}.
-    Esta funcion los consolida en una lista deduplicada para
-    garantizar que todos los gameweek_id existen antes de insertar matches.
+    Garantiza que ningun home_team_id / away_team_id quede sin referencia
+    en la tabla teams por no estar en subscription.teams.
+    Solo se insertan campos minimos (id, slug, name).
     """
+    seen: dict = {}
+    for row in snapshots:
+        if not row["resource"].startswith("matches_week_"):
+            continue
+        payload = json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"]
+        for m in payload.get("matches", []):
+            for key in ("home_team", "away_team"):
+                t = m.get(key) or {}
+                tid = _int(t.get("id"))
+                if tid and tid not in seen:
+                    seen[tid] = {
+                        "team_id":   tid,
+                        "slug":      t.get("slug") or "",
+                        "name":      t.get("name") or t.get("nickname") or str(tid),
+                        "shortname": t.get("shortname") or t.get("nickname"),
+                        "color":     t.get("color"),
+                        "opta_id":   str(t.get("opta_id")) if t.get("opta_id") else None,
+                        "lde_id":    _int(t.get("lde_id")),
+                    }
+    return list(seen.values())
+
+
+def extract_gameweeks_from_matches(snapshots: List[Dict], season_id: int) -> List[Dict]:
     seen = set()
     gameweeks = []
     for row in snapshots:
@@ -256,52 +289,50 @@ def insert_standings(conn, rows: List[Dict]) -> None:
             ) VALUES (
                 :season_id, :team_id, :position, :points, :played, :won, :drawn, :lost,
                 :goals_for, :goals_against, :goal_difference, :qualify_name
-            )
+            ) ON CONFLICT DO NOTHING
         """), r)
 
 
-# ------------------------------------------------------------------ runner
+# ------------------------------------------------------------------ season runner
 
-def run(db_url: str | None = None) -> None:
-    db_url = db_url or os.environ["DATABASE_URL"]
-    engine = create_engine(db_url, pool_pre_ping=True)
+def normalize_season(engine, season_label: str, snapshots: List[Dict]) -> None:
+    """Normaliza todos los snapshots de una temporada concreta."""
+    logger.info("--- Normalizing season %s (%d snapshots) ---", season_label, len(snapshots))
 
-    with engine.connect() as conn:
-        snapshots = conn.execute(text(
-            "SELECT resource, payload FROM raw_snapshots ORDER BY resource"
-        )).mappings().all()
-    snapshots = list(snapshots)
-
-    logger.info("Found %d raw snapshots to normalize", len(snapshots))
-
-    season_id: int | None = None
-
-    # Paso 1: subscription -> season + teams + gameweeks (de subscription)
-    for row in snapshots:
-        if row["resource"] == "subscription":
-            payload = json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"]
-            sub_data = parse_subscription(payload)
-            season_id = sub_data["season"]["season_id"]
-            with engine.begin() as conn:
-                upsert_season(conn, sub_data["season"])
-                upsert_teams(conn, sub_data["teams"])
-                upsert_gameweeks(conn, sub_data["gameweeks"])
-            logger.info("Upserted season=%s teams=%d gameweeks_from_sub=%d",
-                        season_id, len(sub_data["teams"]), len(sub_data["gameweeks"]))
-            break
-
-    if not season_id:
-        logger.error("No subscription snapshot found — cannot normalize")
+    # Paso 1: subscription -> season + teams (de subscription)
+    sub_row = next((r for r in snapshots if r["resource"] == "subscription"), None)
+    if not sub_row:
+        logger.warning("Season %s: no subscription snapshot found, skipping", season_label)
         return
 
-    # Paso 1b: extraer gameweeks embebidos en los partidos (fuente de verdad real)
+    payload = json.loads(sub_row["payload"]) if isinstance(sub_row["payload"], str) else sub_row["payload"]
+    sub_data = parse_subscription(payload)
+    season_id = sub_data["season"]["season_id"]
+    if not season_id:
+        logger.error("Season %s: could not parse season_id, skipping", season_label)
+        return
+
+    # Extraer equipos adicionales desde los propios partidos (fallback FK-safe)
+    match_teams = extract_teams_from_matches(snapshots)
+    all_teams = {t["team_id"]: t for t in sub_data["teams"]}
+    for t in match_teams:
+        all_teams.setdefault(t["team_id"], t)  # sub_data tiene prioridad
+
+    with engine.begin() as conn:
+        upsert_season(conn, sub_data["season"])
+        upsert_teams(conn, list(all_teams.values()))
+        upsert_gameweeks(conn, sub_data["gameweeks"])
+    logger.info("Upserted season=%s teams=%d gameweeks_from_sub=%d",
+                season_id, len(all_teams), len(sub_data["gameweeks"]))
+
+    # Paso 1b: gameweeks embebidos en los partidos (fuente de verdad real)
     match_gameweeks = extract_gameweeks_from_matches(snapshots, season_id)
     with engine.begin() as conn:
         upsert_gameweeks(conn, match_gameweeks)
 
     # Paso 2: matches_week_* -> matches
     total_matches = 0
-    for row in snapshots:
+    for row in sorted(snapshots, key=lambda r: r["resource"]):
         resource = row["resource"]
         if not resource.startswith("matches_week_"):
             continue
@@ -311,23 +342,64 @@ def run(db_url: str | None = None) -> None:
         with engine.begin() as conn:
             upsert_matches(conn, matches)
         total_matches += len(matches)
-        logger.info("Week %2d: %d matches", week, len(matches))
 
-    logger.info("Total matches upserted: %d", total_matches)
+    logger.info("Season %s: %d matches upserted", season_label, total_matches)
 
     # Paso 3: standing -> standings
-    for row in snapshots:
-        if row["resource"] == "standing":
-            payload = json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"]
-            standing_rows = parse_standing(payload, season_id)
-            with engine.begin() as conn:
-                insert_standings(conn, standing_rows)
-            logger.info("Inserted %d standing rows", len(standing_rows))
-            break
+    standing_row = next((r for r in snapshots if r["resource"] == "standing"), None)
+    if standing_row:
+        payload = json.loads(standing_row["payload"]) if isinstance(standing_row["payload"], str) else standing_row["payload"]
+        standing_rows = parse_standing(payload, season_id)
+        with engine.begin() as conn:
+            insert_standings(conn, standing_rows)
+        logger.info("Season %s: %d standing rows inserted", season_label, len(standing_rows))
 
-    logger.info("Normalization complete")
+
+# ------------------------------------------------------------------ main runner
+
+def run(db_url: str | None = None, season_filter: str | None = None) -> None:
+    db_url = db_url or os.environ["DATABASE_URL"]
+    engine = create_engine(db_url, pool_pre_ping=True)
+
+    with engine.connect() as conn:
+        snapshots = conn.execute(text(
+            "SELECT season_label, resource, payload FROM raw_snapshots ORDER BY season_label, resource"
+        )).mappings().all()
+    snapshots = list(snapshots)
+    logger.info("Found %d raw snapshots total", len(snapshots))
+
+    # Agrupar por season_label
+    by_season: Dict[str, List[Dict]] = {}
+    for row in snapshots:
+        label = row["season_label"]
+        by_season.setdefault(label, []).append(row)
+
+    labels = sorted(by_season.keys())
+    if season_filter:
+        labels = [l for l in labels if l == season_filter]
+        if not labels:
+            logger.error("Season '%s' not found in raw_snapshots", season_filter)
+            return
+
+    logger.info("Seasons to normalize: %s", labels)
+
+    for label in labels:
+        # Deduplicar: si hay multiples snapshots del mismo resource (reingestas),
+        # quedarse con el mas reciente (ultimo en orden de insercion)
+        seen_resources: Dict[str, Dict] = {}
+        for row in by_season[label]:
+            seen_resources[row["resource"]] = row  # sobreescribe con el ultimo
+        normalize_season(engine, label, list(seen_resources.values()))
+
+    logger.info("All seasons normalized")
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    run()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--season", default=None, help="Normalizar solo esta temporada (ej: 2015)")
+    args = parser.parse_args()
+    run(season_filter=args.season)
