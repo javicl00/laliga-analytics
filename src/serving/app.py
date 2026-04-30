@@ -63,7 +63,7 @@ def startup():
     load_model()
 
 
-# ── Schemas ───────────────────────────────────────────────────────────
+# ── Schemas ─────────────────────────────────────────────────────
 
 class PredictRequest(BaseModel):
     home_team_id: int
@@ -85,7 +85,7 @@ class SimulateRequest(BaseModel):
     simulations: int = 5000
 
 
-# ── Helpers ───────────────────────────────────────────────────────────
+# ── Helpers ─────────────────────────────────────────────────────
 
 def _predict_probs(home_id: int, away_id: int) -> tuple[float, float, float]:
     """Devuelve (prob_home, prob_draw, prob_away) para un partido."""
@@ -124,7 +124,7 @@ def _predict_probs(home_id: int, away_id: int) -> tuple[float, float, float]:
     )
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────
+# ── Endpoints ─────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
@@ -213,8 +213,10 @@ def predict(req: PredictRequest):
 def simulate_standings(req: SimulateRequest):
     """Simulacion Montecarlo: distribucion de posicion final para un equipo.
 
-    Devuelve pending_matches_count para que el cliente sepa si la simulacion
-    tiene varianza real o la temporada ya esta completada.
+    Campos de respuesta:
+      pending_matches_count  -> total de partidos pendientes en la liga
+      team_pending_count     -> partidos pendientes del equipo solicitado
+      season_complete        -> True si no quedan partidos
     """
     if load_model() is None:
         raise HTTPException(503, "Model not available")
@@ -241,6 +243,12 @@ def simulate_standings(req: SimulateRequest):
     pending_list = list(pending_rows)
     pending_count = len(pending_list)
 
+    # Partidos pendientes que involucran al equipo solicitado
+    team_pending_count = sum(
+        1 for m in pending_list
+        if m["home_team_id"] == req.team_id or m["away_team_id"] == req.team_id
+    )
+
     # Sin partidos pendientes: clasificacion final ya determinada
     if pending_count == 0:
         base_points = {r["team_id"]: r["points"] for r in standing_rows}
@@ -254,7 +262,8 @@ def simulate_standings(req: SimulateRequest):
             "team_id":               req.team_id,
             "simulations":           0,
             "pending_matches_count": 0,
-            "season_complete":        True,
+            "team_pending_count":    0,
+            "season_complete":       True,
             "position_distribution": {str(pos): 1.0},
         }
 
@@ -307,6 +316,7 @@ def simulate_standings(req: SimulateRequest):
         "team_id":               req.team_id,
         "simulations":           N,
         "pending_matches_count": pending_count,
-        "season_complete":        False,
+        "team_pending_count":    team_pending_count,
+        "season_complete":       False,
         "position_distribution": distribution,
     }

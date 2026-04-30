@@ -20,7 +20,6 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── CSS minimo ───────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
     .match-card {
@@ -40,7 +39,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=300)
 def get_teams():
@@ -143,7 +142,7 @@ def standings_chart(dist: dict, team_name: str) -> go.Figure:
     return fig
 
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────────
+# ── Sidebar ───────────────────────────────────────────────────────────
 
 with st.sidebar:
     st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/a/a7/LaLiga_logo_2023.svg/200px-LaLiga_logo_2023.svg.png",
@@ -159,9 +158,9 @@ with st.sidebar:
     st.caption("Modelo: Logistic Regression | RPS val: 0.2019")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 # SECCIÓN 1 — Predicción por Jornada
-# ══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 
 if seccion == "📅 Predicción por Jornada":
     st.title("📅 Predicción por Jornada")
@@ -261,9 +260,9 @@ if seccion == "📅 Predicción por Jornada":
         st.session_state.pop("predecir_jornada", None)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 # SECCIÓN 2 — Partido Individual
-# ══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 
 elif seccion == "🔮 Partido Individual":
     st.title("🔮 Predicción Partido Individual")
@@ -310,9 +309,9 @@ elif seccion == "🔮 Partido Individual":
                 st.error(f"Error al predecir: {e}")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 # SECCIÓN 3 — Simulación Clasificación
-# ══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 
 else:
     st.title("📊 Simulación de Clasificación Final")
@@ -338,19 +337,22 @@ else:
         with st.spinner(f"Ejecutando {sims:,} simulaciones..."):
             try:
                 result = simulate_standings(team_map[team_name], sims)
-                dist   = result["position_distribution"]
-                pending = result.get("pending_matches_count", -1)
+                dist            = result["position_distribution"]
                 season_complete = result.get("season_complete", False)
+                team_pending    = result.get("team_pending_count", 0)
+                league_pending  = result.get("pending_matches_count", 0)
 
-                # Aviso si la temporada ya esta completada en BD
-                if season_complete or pending == 0:
+                if season_complete or league_pending == 0:
                     st.warning(
                         "⚠️ La temporada almacenada está completada — no hay partidos pendientes "
                         "en la base de datos. La posición mostrada es la clasificación final real. "
                         "Ejecuta la ingestión de la temporada actual para simulaciones predictivas."
                     )
                 else:
-                    st.info(f"🔄 Simulando sobre **{pending} partidos pendientes**")
+                    st.info(
+                        f"🔄 **{team_name}** tiene **{team_pending} partido{'s' if team_pending != 1 else ''} pendiente{'s' if team_pending != 1 else ''}** "
+                        f"({league_pending} en total en la liga)"
+                    )
 
                 st.plotly_chart(
                     standings_chart(dist, team_name),
