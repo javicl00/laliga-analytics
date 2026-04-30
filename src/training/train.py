@@ -7,6 +7,13 @@ Validacion walk-forward (sin data leakage temporal):
 
 Metrica principal: RPS (Ranked Probability Score).
 El modelo entrenado se guarda en models/lgbm_v1.pkl.
+
+Features v2 (19 columnas, alineadas con build_features.FEATURE_COLUMNS):
+  - ELO dinamico: home_elo, away_elo, elo_diff
+  - Estado competitivo: home/away_points_total, home/away_table_position,
+    position_diff, home/away_gd_total
+  - Forma reciente (ultimos 5): home/away_goals_for/against_last5
+  - Contexto: gameweek, home/away_rest_days, home/away_pressure_index
 """
 from __future__ import annotations
 
@@ -26,10 +33,19 @@ from sklearn.metrics import log_loss
 logger = logging.getLogger(__name__)
 
 FEATURE_COLS = [
-    "home_form_pts", "away_form_pts",
-    "home_gf_avg",   "home_gc_avg",
-    "away_gf_avg",   "away_gc_avg",
-    "h2h_home_wins", "h2h_draws",  "h2h_away_wins",
+    # Familia D: ELO
+    "home_elo", "away_elo", "elo_diff",
+    # Familia A: Estado competitivo
+    "home_points_total", "away_points_total",
+    "home_table_position", "away_table_position", "position_diff",
+    "home_gd_total", "away_gd_total",
+    # Familia B: Forma reciente
+    "home_goals_for_last5", "home_goals_against_last5",
+    "away_goals_for_last5", "away_goals_against_last5",
+    # Familia E: Contexto
+    "home_rest_days", "away_rest_days",
+    "home_pressure_index", "away_pressure_index",
+    "gameweek",
 ]
 TARGET_COL = "result"   # home | draw | away
 CLASSES    = ["home", "draw", "away"]
@@ -117,7 +133,6 @@ def evaluate(
     X = df[FEATURE_COLS].fillna(0)
     y = df[TARGET_COL].values
     probs = model.predict_proba(X)
-    # Reordenar columnas al orden CLASSES
     col_order = [list(model.classes_).index(c) for c in CLASSES]
     probs = probs[:, col_order]
     metrics = {
@@ -175,13 +190,13 @@ def run(
 
 
 if __name__ == "__main__":
-    import os
     logging.basicConfig(level=logging.INFO)
     from sqlalchemy import create_engine, text as sqlt
     engine = create_engine(os.environ["DATABASE_URL"])
     with engine.connect() as conn:
         matches = pd.read_sql(sqlt(
-            "SELECT m.*, f.* FROM matches m "
+            "SELECT m.match_id, m.gameweek_week, m.result, f.* "
+            "FROM matches m "
             "JOIN match_features f USING (match_id) "
             "WHERE m.competition_main=TRUE AND m.result IS NOT NULL"
         ), conn)

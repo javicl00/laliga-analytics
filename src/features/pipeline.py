@@ -1,4 +1,15 @@
-"""Pipeline completo: extrae matches de BD, computa features y las persiste."""
+"""Pipeline completo: extrae matches de BD, computa features y las persiste.
+
+Usa FeatureBuilder (build_features.py) que calcula 19 features ricas:
+  - ELO dinamico (home_elo, away_elo, elo_diff)
+  - Estado competitivo desde standings snapshot (home/away_points_total,
+    home/away_table_position, position_diff, home/away_gd_total)
+  - Forma reciente ultimos 5 (home/away_goals_for/against_last5)
+  - Contexto: gameweek, home/away_rest_days, home/away_pressure_index
+
+Anti-leakage: todas las features usan datos PREVIOS al kickoff del partido.
+Procesa todos los partidos (con y sin resultado) para soportar inferencia.
+"""
 from __future__ import annotations
 
 import logging
@@ -7,7 +18,7 @@ import os
 import pandas as pd
 from sqlalchemy import create_engine, text
 
-from src.features.builder import build_features
+from src.features.build_features import FeatureBuilder, FEATURE_COLUMNS
 from src.storage.repository import PostgresRawRepository
 
 logger = logging.getLogger(__name__)
@@ -19,9 +30,9 @@ def run(season_id: int | None = None, db_url: str | None = None) -> None:
     repo = PostgresRawRepository(db_url)
 
     query = """
-        SELECT match_id, kickoff_at, gameweek_week,
+        SELECT match_id, season_id, kickoff_at, gameweek_week,
                home_team_id, away_team_id,
-               home_score, away_score, result
+               home_score, away_score, result, status
         FROM matches
         WHERE competition_main = TRUE
     """
@@ -35,10 +46,11 @@ def run(season_id: int | None = None, db_url: str | None = None) -> None:
         df = pd.read_sql(text(query), conn, params=params)
 
     logger.info("Loaded %d matches for feature engineering", len(df))
-    features_df = build_features(df)
+    features_df = FeatureBuilder(df).build()
     logger.info("Computed features for %d matches", len(features_df))
 
-    rows = features_df.to_dict(orient="records")
+    cols = ["match_id"] + FEATURE_COLUMNS
+    rows = features_df[cols].to_dict(orient="records")
     repo.upsert_match_features(rows)
     logger.info("Feature pipeline complete")
 

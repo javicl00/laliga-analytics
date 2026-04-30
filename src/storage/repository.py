@@ -126,30 +126,53 @@ class PostgresRawRepository:
         logger.info("Inserted %d standing rows", len(rows))
 
     def upsert_match_features(self, rows: List[Dict]) -> None:
+        """Upsert de features ricas v2 (schema match_features v2).
+
+        Columnas esperadas en cada dict: match_id + las 19 de FEATURE_COLUMNS
+        definidas en src/features/build_features.py.
+        """
         sql = text("""
             INSERT INTO match_features (
-                match_id, home_form_pts, away_form_pts,
-                home_gf_avg, home_gc_avg, away_gf_avg, away_gc_avg,
-                home_position, away_position,
-                h2h_home_wins, h2h_draws, h2h_away_wins
+                match_id,
+                home_elo, away_elo, elo_diff,
+                home_points_total, away_points_total,
+                home_table_position, away_table_position, position_diff,
+                home_gd_total, away_gd_total,
+                home_goals_for_last5, home_goals_against_last5,
+                away_goals_for_last5, away_goals_against_last5,
+                gameweek, home_rest_days, away_rest_days,
+                home_pressure_index, away_pressure_index
             ) VALUES (
-                :match_id, :home_form_pts, :away_form_pts,
-                :home_gf_avg, :home_gc_avg, :away_gf_avg, :away_gc_avg,
-                :home_position, :away_position,
-                :h2h_home_wins, :h2h_draws, :h2h_away_wins
+                :match_id,
+                :home_elo, :away_elo, :elo_diff,
+                :home_points_total, :away_points_total,
+                :home_table_position, :away_table_position, :position_diff,
+                :home_gd_total, :away_gd_total,
+                :home_goals_for_last5, :home_goals_against_last5,
+                :away_goals_for_last5, :away_goals_against_last5,
+                :gameweek, :home_rest_days, :away_rest_days,
+                :home_pressure_index, :away_pressure_index
             )
             ON CONFLICT (match_id) DO UPDATE SET
-                home_form_pts=EXCLUDED.home_form_pts,
-                away_form_pts=EXCLUDED.away_form_pts,
-                home_gf_avg=EXCLUDED.home_gf_avg,
-                home_gc_avg=EXCLUDED.home_gc_avg,
-                away_gf_avg=EXCLUDED.away_gf_avg,
-                away_gc_avg=EXCLUDED.away_gc_avg,
-                home_position=EXCLUDED.home_position,
-                away_position=EXCLUDED.away_position,
-                h2h_home_wins=EXCLUDED.h2h_home_wins,
-                h2h_draws=EXCLUDED.h2h_draws,
-                h2h_away_wins=EXCLUDED.h2h_away_wins,
+                home_elo=EXCLUDED.home_elo,
+                away_elo=EXCLUDED.away_elo,
+                elo_diff=EXCLUDED.elo_diff,
+                home_points_total=EXCLUDED.home_points_total,
+                away_points_total=EXCLUDED.away_points_total,
+                home_table_position=EXCLUDED.home_table_position,
+                away_table_position=EXCLUDED.away_table_position,
+                position_diff=EXCLUDED.position_diff,
+                home_gd_total=EXCLUDED.home_gd_total,
+                away_gd_total=EXCLUDED.away_gd_total,
+                home_goals_for_last5=EXCLUDED.home_goals_for_last5,
+                home_goals_against_last5=EXCLUDED.home_goals_against_last5,
+                away_goals_for_last5=EXCLUDED.away_goals_for_last5,
+                away_goals_against_last5=EXCLUDED.away_goals_against_last5,
+                gameweek=EXCLUDED.gameweek,
+                home_rest_days=EXCLUDED.home_rest_days,
+                away_rest_days=EXCLUDED.away_rest_days,
+                home_pressure_index=EXCLUDED.home_pressure_index,
+                away_pressure_index=EXCLUDED.away_pressure_index,
                 computed_at=now()
         """)
         with self.engine.begin() as conn:
