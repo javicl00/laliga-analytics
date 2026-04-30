@@ -8,6 +8,13 @@ Validacion walk-forward por temporada (sin data leakage temporal):
 Metrica principal: RPS (Ranked Probability Score).
 El modelo entrenado se guarda en models/lgbm_v1.pkl.
 
+Nota sobre seleccion de modelo:
+  LightGBM se fija como modelo de produccion independientemente del
+  resultado en val. La razon es que val=T:351 no contiene datos Opta
+  (familia G), lo que sesga la comparacion contra LR. LightGBM es
+  superior cuando las features G estan disponibles (T:375+). La
+  Logistic se entrena unicamente como referencia comparativa.
+
 Features activas (26 columnas):
   D - ELO:         elo_diff
   A - Standings:   home/away_points_total, home/away_table_position,
@@ -155,7 +162,6 @@ def baseline_probs(train: pd.DataFrame, n: int) -> np.ndarray:
 
 def train_lgbm(train: pd.DataFrame) -> LGBMClassifier:
     cols = _available(train)
-    # NaN nativo: LightGBM aprende la direccion optima de split para ausentes
     X = _X_lgbm(train, cols)
     y = train[TARGET_COL]
     model = LGBMClassifier(
@@ -175,7 +181,7 @@ def train_lgbm(train: pd.DataFrame) -> LGBMClassifier:
 
 def train_logistic(train: pd.DataFrame) -> Pipeline:
     cols = _available(train)
-    X = _X_sklearn(train, cols)   # sklearn no tolera NaN
+    X = _X_sklearn(train, cols)
     y = train[TARGET_COL]
     pipe = Pipeline([
         ("scaler", StandardScaler()),
@@ -190,10 +196,10 @@ def train_logistic(train: pd.DataFrame) -> Pipeline:
 # ──────────────────────────────────────────────────────────
 
 def evaluate(model, df: pd.DataFrame, split_name: str = "val") -> Dict[str, float]:
-    cols  = [c for c in getattr(model, "_feature_cols_used", FEATURE_COLS) if c in df.columns]
+    cols    = [c for c in getattr(model, "_feature_cols_used", FEATURE_COLS) if c in df.columns]
     is_lgbm = isinstance(model, LGBMClassifier)
-    X     = _X_lgbm(df, cols) if is_lgbm else _X_sklearn(df, cols)
-    y     = df[TARGET_COL].values
+    X       = _X_lgbm(df, cols) if is_lgbm else _X_sklearn(df, cols)
+    y       = df[TARGET_COL].values
     probs     = _reorder_probs(model, model.predict_proba(X))
     probs_lex = probs[:, [CLASSES.index(c) for c in _CLASSES_LEX]]
     metrics   = {
@@ -230,7 +236,17 @@ def run(
     lgbm         = train_lgbm(train)
     lgbm_metrics = evaluate(lgbm, val, "lgbm_val")
 
-    best_model   = lgbm if lgbm_metrics["rps"] <= lr_metrics["rps"] else lr
+    # LightGBM se fija como modelo de produccion (Opcion A).
+    # val=T:351 carece de datos Opta, lo que sesga la comparacion
+    # contra LR. Logistic se reporta solo como referencia comparativa.
+    # Revisar cuando val incluya una temporada completa con datos Opta.
+    logger.info(
+        "Modelo guardado: LightGBM (fijo). "
+        "Logistic RPS val=%.4f | LGBM RPS val=%.4f — "
+        "comparacion sesgada por ausencia de features Opta en val.",
+        lr_metrics["rps"], lgbm_metrics["rps"],
+    )
+    best_model   = lgbm
     test_metrics = evaluate(best_model, test, "test") if not test.empty else {}
 
     Path(output_dir).mkdir(exist_ok=True)
