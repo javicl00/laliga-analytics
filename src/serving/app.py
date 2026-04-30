@@ -63,7 +63,7 @@ def startup():
     load_model()
 
 
-# ── Schemas ───────────────────────────────────────────────────────────────────
+# ── Schemas ─────────────────────────────────────────────────────────────────────────
 
 class PredictRequest(BaseModel):
     home_team_id: int
@@ -85,7 +85,7 @@ class SimulateRequest(BaseModel):
     simulations: int = 5000
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Helpers ─────────────────────────────────────────────────────────────────────────
 
 def _predict_probs(home_id: int, away_id: int) -> tuple[float, float, float]:
     """Devuelve (prob_home, prob_draw, prob_away) para un partido."""
@@ -115,6 +115,8 @@ def _predict_probs(home_id: int, away_id: int) -> tuple[float, float, float]:
     from lightgbm import LGBMClassifier
     if not isinstance(model, LGBMClassifier):
         X = X.fillna(0)
+    else:
+        X = X.apply(pd.to_numeric, errors="coerce")
 
     probs_raw = model.predict_proba(X)[0]
     classes   = list(model.classes_)
@@ -126,7 +128,7 @@ def _predict_probs(home_id: int, away_id: int) -> tuple[float, float, float]:
     )
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
+# ── Endpoints ─────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
@@ -160,6 +162,9 @@ def standings():
 
 @app.get("/matches/upcoming")
 def upcoming_matches(limit: int = 10):
+    """Partidos proximos: filtra por result IS NULL (robusto frente a
+    variaciones en el campo status: 'Scheduled', 'NS', 'NotStarted', etc.)
+    """
     with get_engine().connect() as conn:
         rows = conn.execute(text("""
             SELECT m.match_id, m.kickoff_at, m.gameweek_week,
@@ -168,7 +173,8 @@ def upcoming_matches(limit: int = 10):
             FROM matches m
             JOIN teams ht  ON ht.team_id  = m.home_team_id
             JOIN teams at2 ON at2.team_id = m.away_team_id
-            WHERE m.status = 'Scheduled' AND m.competition_main = TRUE
+            WHERE m.result IS NULL
+              AND m.competition_main = TRUE
             ORDER BY m.kickoff_at
             LIMIT :limit
         """), {"limit": limit}).mappings().all()
@@ -177,6 +183,9 @@ def upcoming_matches(limit: int = 10):
 
 @app.get("/matches/by-jornada")
 def matches_by_jornada(jornada: int):
+    """Partidos de una jornada: filtra por result IS NULL para incluir
+    todos los partidos pendientes independientemente del valor de status.
+    """
     with get_engine().connect() as conn:
         rows = conn.execute(text("""
             SELECT m.match_id, m.kickoff_at, m.gameweek_week,
@@ -186,7 +195,7 @@ def matches_by_jornada(jornada: int):
             JOIN teams ht  ON ht.team_id  = m.home_team_id
             JOIN teams at2 ON at2.team_id = m.away_team_id
             WHERE m.gameweek_week = :jornada
-              AND m.status = 'Scheduled'
+              AND m.result IS NULL
               AND m.competition_main = TRUE
             ORDER BY m.kickoff_at
         """), {"jornada": jornada}).mappings().all()
@@ -210,20 +219,11 @@ def predict(req: PredictRequest):
 
 @app.post("/simulate/standings")
 def simulate_standings(req: SimulateRequest):
-    """Simulacion Montecarlo: distribucion de posicion final para un equipo.
-
-    Algoritmo:
-      1. Carga la clasificacion actual (puntos, partidos jugados)
-      2. Obtiene los partidos pendientes de la temporada
-      3. Por cada simulacion, sortea resultados segun probabilidades del modelo
-         y calcula la posicion final de req.team_id
-      4. Devuelve la distribucion de frecuencias de posicion
-    """
+    """Simulacion Montecarlo: distribucion de posicion final para un equipo."""
     if load_model() is None:
         raise HTTPException(503, "Model not available")
 
     with get_engine().connect() as conn:
-        # Clasificacion actual
         standing_rows = conn.execute(text("""
             SELECT t.team_id, s.points, s.goal_difference
             FROM standings s
@@ -231,11 +231,11 @@ def simulate_standings(req: SimulateRequest):
             WHERE s.fetched_at = (SELECT MAX(fetched_at) FROM standings)
         """)).mappings().all()
 
-        # Partidos pendientes de la temporada actual
+        # Partidos pendientes: result IS NULL (mismo criterio que /upcoming)
         pending_rows = conn.execute(text("""
             SELECT m.match_id, m.home_team_id, m.away_team_id
             FROM matches m
-            WHERE m.status = 'Scheduled'
+            WHERE m.result IS NULL
               AND m.competition_main = TRUE
             ORDER BY m.kickoff_at
         """)).mappings().all()
@@ -243,14 +243,13 @@ def simulate_standings(req: SimulateRequest):
     if not standing_rows:
         raise HTTPException(404, "No hay clasificacion disponible")
 
-    # Probabilidades para todos los partidos pendientes (calculadas una vez)
     match_probs = {}
     for m in pending_rows:
         ph, pd_, pa = _predict_probs(m["home_team_id"], m["away_team_id"])
         match_probs[m["match_id"]] = {
             "home_id": m["home_team_id"],
             "away_id": m["away_team_id"],
-            "probs":   [ph, pd_, pa],  # home win, draw, away win
+            "probs":   [ph, pd_, pa],
         }
 
     base_points = {r["team_id"]: r["points"] for r in standing_rows}
@@ -280,7 +279,6 @@ def simulate_standings(req: SimulateRequest):
                 gd[a]  = gd.get(a, 0)  + 1
                 gd[h]  = gd.get(h, 0)  - 1
 
-        # Ordenar por puntos desc, luego GD desc
         ranked = sorted(all_teams,
                         key=lambda t: (pts.get(t, 0), gd.get(t, 0)),
                         reverse=True)
