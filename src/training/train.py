@@ -8,12 +8,14 @@ Validacion walk-forward (sin data leakage temporal):
 Metrica principal: RPS (Ranked Probability Score).
 El modelo entrenado se guarda en models/lgbm_v1.pkl.
 
-Features v2 (19 columnas, alineadas con build_features.FEATURE_COLUMNS):
-  - ELO dinamico: home_elo, away_elo, elo_diff
-  - Estado competitivo: home/away_points_total, home/away_table_position,
-    position_diff, home/away_gd_total
-  - Forma reciente (ultimos 5): home/away_goals_for/against_last5
-  - Contexto: gameweek, home/away_rest_days, home/away_pressure_index
+Features activas (10 columnas con datos reales):
+  - ELO dinamico:     home_elo, away_elo, elo_diff
+  - Forma reciente:   home/away_goals_for/against_last5
+  - Contexto:         home_rest_days, away_rest_days, gameweek
+
+Features pendientes (standings snapshot por jornada no disponible):
+  home/away_points_total, home/away_table_position, position_diff,
+  home/away_gd_total, home/away_pressure_index
 """
 from __future__ import annotations
 
@@ -27,24 +29,18 @@ import numpy as np
 import pandas as pd
 from lightgbm import LGBMClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import log_loss
 
 logger = logging.getLogger(__name__)
 
 FEATURE_COLS = [
-    # Familia D: ELO
+    # Familia D: ELO dinamico
     "home_elo", "away_elo", "elo_diff",
-    # Familia A: Estado competitivo
-    "home_points_total", "away_points_total",
-    "home_table_position", "away_table_position", "position_diff",
-    "home_gd_total", "away_gd_total",
-    # Familia B: Forma reciente
-    "home_goals_for_last5", "home_goals_against_last5",
-    "away_goals_for_last5", "away_goals_against_last5",
+    # Familia B: Forma reciente (ultimos 5 partidos)
+    "home_goals_for_last5",   "home_goals_against_last5",
+    "away_goals_for_last5",   "away_goals_against_last5",
     # Familia E: Contexto
     "home_rest_days", "away_rest_days",
-    "home_pressure_index", "away_pressure_index",
     "gameweek",
 ]
 TARGET_COL = "result"   # home | draw | away
@@ -58,6 +54,8 @@ CLASSES    = ["home", "draw", "away"]
 def rps(y_true: np.ndarray, probs: np.ndarray) -> float:
     """Ranked Probability Score (menor es mejor)."""
     n = probs.shape[0]
+    if n == 0:
+        return float("nan")
     total = 0.0
     for i in range(n):
         true_idx = CLASSES.index(y_true[i])
@@ -153,8 +151,16 @@ def run(
     train_end_week: int = 25,
     val_end_week:   int = 30,
 ) -> Dict:
-    df = features_df.dropna(subset=[TARGET_COL] + FEATURE_COLS)
+    # Solo eliminamos filas sin target; los NULLs en features los gestiona fillna(0)
+    df = features_df.dropna(subset=[TARGET_COL])
     train, val, test = temporal_split(df, train_end_week, val_end_week)
+
+    if train.empty or val.empty:
+        raise ValueError(
+            f"Split insuficiente: train={len(train)} val={len(val)}. "
+            "Verifica que el JOIN matches+match_features devuelve filas con result IS NOT NULL "
+            "y que gameweek_week esta poblado."
+        )
 
     # Baseline
     base_probs = baseline_probs(train, len(val))
@@ -195,7 +201,11 @@ if __name__ == "__main__":
     engine = create_engine(os.environ["DATABASE_URL"])
     with engine.connect() as conn:
         matches = pd.read_sql(sqlt(
-            "SELECT m.match_id, m.gameweek_week, m.result, f.* "
+            "SELECT m.match_id, m.gameweek_week, m.result, "
+            "f.home_elo, f.away_elo, f.elo_diff, "
+            "f.home_goals_for_last5, f.home_goals_against_last5, "
+            "f.away_goals_for_last5, f.away_goals_against_last5, "
+            "f.home_rest_days, f.away_rest_days, f.gameweek "
             "FROM matches m "
             "JOIN match_features f USING (match_id) "
             "WHERE m.competition_main=TRUE AND m.result IS NOT NULL"
