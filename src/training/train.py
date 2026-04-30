@@ -8,14 +8,13 @@ Validacion walk-forward (sin data leakage temporal):
 Metrica principal: RPS (Ranked Probability Score).
 El modelo entrenado se guarda en models/lgbm_v1.pkl.
 
-Features activas (10 columnas con datos reales):
-  - ELO dinamico:     home_elo, away_elo, elo_diff
-  - Forma reciente:   home/away_goals_for/against_last5
-  - Contexto:         home_rest_days, away_rest_days, gameweek
-
-Features pendientes (standings snapshot por jornada no disponible):
-  home/away_points_total, home/away_table_position, position_diff,
-  home/away_gd_total, home/away_pressure_index
+Features activas (17 columnas):
+  - ELO dinamico:       home_elo, away_elo, elo_diff
+  - Estado competitivo: home/away_points_total, home/away_table_position,
+                        position_diff, home/away_gd_total
+  - Forma reciente:     home/away_goals_for/against_last5
+  - Contexto:           home_rest_days, away_rest_days,
+                        home/away_pressure_index, gameweek
 """
 from __future__ import annotations
 
@@ -38,16 +37,21 @@ logger = logging.getLogger(__name__)
 FEATURE_COLS = [
     # Familia D: ELO dinamico
     "home_elo", "away_elo", "elo_diff",
+    # Familia A: Estado competitivo
+    "home_points_total", "away_points_total",
+    "home_table_position", "away_table_position", "position_diff",
+    "home_gd_total", "away_gd_total",
     # Familia B: Forma reciente (ultimos 5 partidos)
     "home_goals_for_last5",   "home_goals_against_last5",
     "away_goals_for_last5",   "away_goals_against_last5",
     # Familia E: Contexto
     "home_rest_days", "away_rest_days",
+    "home_pressure_index", "away_pressure_index",
     "gameweek",
 ]
 TARGET_COL = "result"   # home | draw | away
 CLASSES    = ["home", "draw", "away"]
-# Orden lexicografico que espera sklearn.metrics.log_loss internamente
+# Orden lexicografico que espera sklearn.metrics.log_loss
 _CLASSES_LEX = sorted(CLASSES)   # ['away', 'draw', 'home']
 
 
@@ -75,11 +79,7 @@ def rps(y_true: np.ndarray, probs: np.ndarray) -> float:
 
 
 def _reorder_probs(model, probs: np.ndarray) -> np.ndarray:
-    """Reordena columnas de probs al orden canonico de CLASSES.
-
-    sklearn devuelve probabilidades en orden alfabetico de model.classes_.
-    Esta funcion las remapea a ['home','draw','away'] para RPS y log_loss.
-    """
+    """Reordena columnas de probs al orden canonico de CLASSES."""
     classes: List[str] = list(model.classes_)
     col_order = [classes.index(c) for c in CLASSES]
     return probs[:, col_order]
@@ -117,11 +117,6 @@ def baseline_probs(train: pd.DataFrame, n: int) -> np.ndarray:
 # ──────────────────────────────────────────────────────────
 
 def train_lgbm(train: pd.DataFrame) -> LGBMClassifier:
-    """LightGBM con hiperparametros conservadores para mejor calibracion.
-
-    Reducimos complejidad (num_leaves=15, min_child_samples=20) respecto
-    al baseline anterior que daba log_loss=1.80 por exceso de confianza.
-    """
     X = train[FEATURE_COLS].fillna(0)
     y = train[TARGET_COL]
     model = LGBMClassifier(
@@ -138,12 +133,6 @@ def train_lgbm(train: pd.DataFrame) -> LGBMClassifier:
 
 
 def train_logistic(train: pd.DataFrame) -> Pipeline:
-    """Logistic Regression con StandardScaler (lbfgs requiere features escaladas).
-
-    Pipeline(scaler + LR) evita ConvergenceWarning y mejora la calibracion
-    de probabilidades, especialmente util cuando ELO (~1500) y rest_days (~7)
-    tienen escalas muy diferentes.
-    """
     X = train[FEATURE_COLS].fillna(0)
     y = train[TARGET_COL]
     pipeline = Pipeline([
@@ -168,11 +157,10 @@ def evaluate(
     X = df[FEATURE_COLS].fillna(0)
     y = df[TARGET_COL].values
     raw_probs = model.predict_proba(X)
-    probs = _reorder_probs(model, raw_probs)   # orden canonico: ['home','draw','away']
+    probs = _reorder_probs(model, raw_probs)
 
-    # log_loss requiere orden lexicografico: ['away','draw','home']
-    lex_order = [CLASSES.index(c) for c in _CLASSES_LEX]
-    probs_lex = probs[:, lex_order]
+    lex_order  = [CLASSES.index(c) for c in _CLASSES_LEX]
+    probs_lex  = probs[:, lex_order]
 
     metrics = {
         "rps":      rps(y, probs),
@@ -198,28 +186,23 @@ def run(
     if train.empty or val.empty:
         raise ValueError(
             f"Split insuficiente: train={len(train)} val={len(val)}. "
-            "Verifica que el JOIN matches+match_features devuelve filas con result IS NOT NULL "
-            "y que gameweek_week esta poblado."
+            "Verifica que el JOIN matches+match_features tiene result IS NOT NULL "
+            "y gameweek_week poblado."
         )
 
-    # Baseline
-    base_probs = baseline_probs(train, len(val))
-    base_rps   = rps(val[TARGET_COL].values, base_probs)
+    base_probs_arr = baseline_probs(train, len(val))
+    base_rps       = rps(val[TARGET_COL].values, base_probs_arr)
     logger.info("Baseline RPS (val): %.4f", base_rps)
 
-    # Logistic regression (Pipeline con StandardScaler)
-    lr = train_logistic(train)
+    lr        = train_logistic(train)
     lr_metrics = evaluate(lr, val, "logistic_val")
 
-    # LightGBM (hiperparametros conservadores)
-    lgbm = train_lgbm(train)
+    lgbm        = train_lgbm(train)
     lgbm_metrics = evaluate(lgbm, val, "lgbm_val")
 
-    # Test final con el mejor modelo segun RPS en val
-    best_model = lgbm if lgbm_metrics["rps"] <= lr_metrics["rps"] else lr
+    best_model   = lgbm if lgbm_metrics["rps"] <= lr_metrics["rps"] else lr
     test_metrics = evaluate(best_model, test, "test") if not test.empty else {}
 
-    # Persistir modelo
     Path(output_dir).mkdir(exist_ok=True)
     model_path = Path(output_dir) / "lgbm_v1.pkl"
     with open(model_path, "wb") as f:
@@ -247,9 +230,14 @@ if __name__ == "__main__":
         matches = pd.read_sql(sqlt(
             "SELECT m.match_id, m.gameweek_week, m.result, "
             "f.home_elo, f.away_elo, f.elo_diff, "
+            "f.home_points_total, f.away_points_total, "
+            "f.home_table_position, f.away_table_position, f.position_diff, "
+            "f.home_gd_total, f.away_gd_total, "
             "f.home_goals_for_last5, f.home_goals_against_last5, "
             "f.away_goals_for_last5, f.away_goals_against_last5, "
-            "f.home_rest_days, f.away_rest_days, f.gameweek "
+            "f.home_rest_days, f.away_rest_days, "
+            "f.home_pressure_index, f.away_pressure_index, "
+            "f.gameweek "
             "FROM matches m "
             "JOIN match_features f USING (match_id) "
             "WHERE m.competition_main=TRUE AND m.result IS NOT NULL"
