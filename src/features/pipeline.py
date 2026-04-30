@@ -1,11 +1,15 @@
 """Pipeline completo: extrae matches de BD, computa features y las persiste.
 
-Usa FeatureBuilder (build_features.py) que calcula 19 features ricas:
-  - ELO dinamico (home_elo, away_elo, elo_diff)
-  - Estado competitivo desde standings snapshot (home/away_points_total,
-    home/away_table_position, position_diff, home/away_gd_total)
-  - Forma reciente ultimos 5 (home/away_goals_for/against_last5)
-  - Contexto: gameweek, home/away_rest_days, home/away_pressure_index
+Aplica migraciones SQL pendientes al arrancar (no requiere psql).
+
+Usa FeatureBuilder (build_features.py) que calcula 22 features ricas:
+  D - ELO dinamico (home_elo, away_elo, elo_diff)
+  A - Estado competitivo desde standings snapshot (home/away_points_total,
+      home/away_table_position, position_diff, home/away_gd_total)
+  B - Forma reciente ultimos 5, todos los campos
+      (home/away_goals_for/against_last5)
+  E - Contexto: gameweek, home/away_rest_days, home/away_pressure_index
+  F - Head-to-Head: h2h_home_wins, h2h_draws, h2h_away_wins
 
 Anti-leakage: todas las features usan datos PREVIOS al kickoff del partido.
 Procesa todos los partidos (con y sin resultado) para soportar inferencia.
@@ -21,17 +25,14 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 
 from src.features.build_features import FeatureBuilder, FEATURE_COLUMNS
+from src.storage.migrations import apply_migrations
 from src.storage.repository import PostgresRawRepository
 
 logger = logging.getLogger(__name__)
 
 
 def _sanitize(row: Dict[str, Any]) -> Dict[str, Any]:
-    """Convierte float NaN/Inf a None para compatibilidad con psycopg2.
-
-    psycopg2 no puede castear float('nan') a SMALLINT ni NUMERIC,
-    lanzando NumericValueOutOfRange. None se mapea correctamente a NULL.
-    """
+    """Convierte float NaN/Inf a None para compatibilidad con psycopg2."""
     result = {}
     for k, v in row.items():
         if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
@@ -45,6 +46,9 @@ def run(season_id: int | None = None, db_url: str | None = None) -> None:
     db_url = db_url or os.environ["DATABASE_URL"]
     engine = create_engine(db_url, pool_pre_ping=True)
     repo = PostgresRawRepository(db_url)
+
+    # Aplicar migraciones SQL pendientes antes de cualquier operacion
+    apply_migrations(engine)
 
     query = """
         SELECT match_id, season_id, kickoff_at, gameweek_week,
