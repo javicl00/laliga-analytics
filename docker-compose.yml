@@ -30,8 +30,8 @@ services:
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
-      - ./models:/app/models   # persiste el modelo entrenado al host
-      - ./src:/app/src          # hot-reload del codigo sin rebuild
+      - ./models:/app/models
+      - ./src:/app/src
 
   api:
     build: .
@@ -46,6 +46,26 @@ services:
     volumes:
       - ./src:/app/src
       - ./models:/app/models
+
+  ui:
+    image: python:3.11-slim
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "8501:8501"
+    environment:
+      API_URL: http://api:8000
+    working_dir: /app
+    volumes:
+      - ./ui:/app
+    command: >-
+      bash -c "pip install -q -r requirements.txt &&
+               streamlit run app.py
+               --server.port=8501
+               --server.address=0.0.0.0
+               --server.headless=true
+               --theme.base=dark"
 
 volumes:
   postgres_data:

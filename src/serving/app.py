@@ -1,16 +1,21 @@
 """API REST para predicciones de partidos LaLiga.
 
 Endpoints:
-  GET  /health               -> {status: ok, model_loaded: bool}
-  GET  /matches/upcoming     -> partidos proximos con predicciones
-  POST /predict              -> prediccion para un partido concreto
-  GET  /standings            -> clasificacion actual
+  GET  /health                    -> {status: ok, model_loaded: bool}
+  GET  /teams                     -> lista de equipos
+  GET  /matches/upcoming          -> partidos proximos
+  GET  /matches/by-jornada?jornada=N -> partidos de una jornada concreta
+  POST /predict                   -> prediccion para un partido
+  GET  /standings                 -> clasificacion actual
+  POST /simulate/standings        -> simulacion Montecarlo de posicion final
 """
 from __future__ import annotations
 
 import logging
 import os
 import pickle
+import random
+from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
@@ -25,10 +30,9 @@ logger = logging.getLogger("uvicorn.error")
 app = FastAPI(
     title="LaLiga Analytics API",
     description="Predicciones de partidos LaLiga EA Sports",
-    version="0.1.0-beta",
+    version="0.2.0",
 )
 
-# -- Estado global -------------------------------------------------------------
 _model_bundle: dict | None = None
 _engine = None
 
@@ -41,9 +45,6 @@ def get_engine():
 
 
 def load_model():
-    """Carga lazy: intenta cargar el modelo si aun no esta en memoria.
-    Seguro para llamar multiples veces (no-op si ya esta cargado).
-    """
     global _model_bundle
     if _model_bundle is None:
         path = Path("models/lgbm_v1.pkl")
@@ -52,17 +53,17 @@ def load_model():
                 _model_bundle = pickle.load(f)
             logger.info("Model loaded from %s", path)
         else:
-            logger.warning("Model file not found at %s — predictions disabled", path)
+            logger.warning("Model file not found at %s", path)
     return _model_bundle
 
 
 @app.on_event("startup")
 def startup():
-    get_engine()   # pre-warm conexion a BD
-    load_model()   # intento inicial (puede fallar si aun no existe el .pkl)
+    get_engine()
+    load_model()
 
 
-# -- Schemas -------------------------------------------------------------------
+# ── Schemas ───────────────────────────────────────────────────────────────────
 
 class PredictRequest(BaseModel):
     home_team_id: int
@@ -79,23 +80,74 @@ class PredictResponse(BaseModel):
     model: str
 
 
-# -- Endpoints -----------------------------------------------------------------
+class SimulateRequest(BaseModel):
+    team_id: int
+    simulations: int = 5000
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _predict_probs(home_id: int, away_id: int) -> tuple[float, float, float]:
+    """Devuelve (prob_home, prob_draw, prob_away) para un partido."""
+    bundle = load_model()
+    if bundle is None:
+        return (0.45, 0.28, 0.27)  # fallback frecuencia historica
+
+    with get_engine().connect() as conn:
+        feat_row = conn.execute(text("""
+            SELECT f.*
+            FROM match_features f
+            JOIN matches m USING (match_id)
+            WHERE m.home_team_id = :home AND m.away_team_id = :away
+            ORDER BY m.kickoff_at DESC LIMIT 1
+        """), {"home": home_id, "away": away_id}).mappings().first()
+
+    feat_cols = bundle["feature_cols"]
+    if feat_row is None:
+        feat_values = {c: None for c in feat_cols}
+    else:
+        feat_values = {c: feat_row.get(c) for c in feat_cols}
+
+    X = pd.DataFrame([feat_values])[feat_cols]
+    model = bundle["model"]
+
+    # NaN nativo para LightGBM, fillna(0) para sklearn
+    from lightgbm import LGBMClassifier
+    if not isinstance(model, LGBMClassifier):
+        X = X.fillna(0)
+
+    probs_raw = model.predict_proba(X)[0]
+    classes   = list(model.classes_)
+    prob_map  = dict(zip(classes, probs_raw))
+    return (
+        float(prob_map.get("home", 0.45)),
+        float(prob_map.get("draw", 0.28)),
+        float(prob_map.get("away", 0.27)),
+    )
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
-    """Intenta carga lazy del modelo en cada llamada si no esta disponible.
-    Permite que la API detecte automaticamente un modelo recien entrenado
-    sin necesidad de reiniciar el contenedor.
-    """
     load_model()
     return {"status": "ok", "model_loaded": _model_bundle is not None}
+
+
+@app.get("/teams")
+def teams():
+    with get_engine().connect() as conn:
+        rows = conn.execute(text(
+            "SELECT team_id, name, shortname FROM teams ORDER BY name"
+        )).mappings().all()
+    return {"teams": [dict(r) for r in rows]}
 
 
 @app.get("/standings")
 def standings():
     with get_engine().connect() as conn:
         rows = conn.execute(text("""
-            SELECT s.position, t.name, t.shortname,
+            SELECT s.position, t.name, t.shortname, t.team_id,
                    s.points, s.played, s.won, s.drawn, s.lost,
                    s.goals_for, s.goals_against, s.goal_difference, s.qualify_name
             FROM standings s
@@ -111,54 +163,135 @@ def upcoming_matches(limit: int = 10):
     with get_engine().connect() as conn:
         rows = conn.execute(text("""
             SELECT m.match_id, m.kickoff_at, m.gameweek_week,
-                   ht.name AS home_team, at2.name AS away_team,
-                   p.prob_home, p.prob_draw, p.prob_away
+                   m.home_team_id, m.away_team_id,
+                   ht.name AS home_team, at2.name AS away_team
             FROM matches m
             JOIN teams ht  ON ht.team_id  = m.home_team_id
             JOIN teams at2 ON at2.team_id = m.away_team_id
-            LEFT JOIN LATERAL (
-                SELECT prob_home, prob_draw, prob_away
-                FROM predictions
-                WHERE match_id = m.match_id
-                ORDER BY predicted_at DESC LIMIT 1
-            ) p ON TRUE
-            WHERE m.status = 'scheduled' AND m.competition_main = TRUE
+            WHERE m.status = 'Scheduled' AND m.competition_main = TRUE
             ORDER BY m.kickoff_at
             LIMIT :limit
         """), {"limit": limit}).mappings().all()
     return {"matches": [dict(r) for r in rows]}
 
 
+@app.get("/matches/by-jornada")
+def matches_by_jornada(jornada: int):
+    with get_engine().connect() as conn:
+        rows = conn.execute(text("""
+            SELECT m.match_id, m.kickoff_at, m.gameweek_week,
+                   m.home_team_id, m.away_team_id,
+                   ht.name AS home_team, at2.name AS away_team
+            FROM matches m
+            JOIN teams ht  ON ht.team_id  = m.home_team_id
+            JOIN teams at2 ON at2.team_id = m.away_team_id
+            WHERE m.gameweek_week = :jornada
+              AND m.status = 'Scheduled'
+              AND m.competition_main = TRUE
+            ORDER BY m.kickoff_at
+        """), {"jornada": jornada}).mappings().all()
+    return {"matches": [dict(r) for r in rows]}
+
+
 @app.post("/predict", response_model=PredictResponse)
 def predict(req: PredictRequest):
-    bundle = load_model()
-    if bundle is None:
+    if load_model() is None:
         raise HTTPException(503, "Model not available")
-
-    with get_engine().connect() as conn:
-        feat_row = conn.execute(text("""
-            SELECT f.*
-            FROM match_features f
-            JOIN matches m USING (match_id)
-            WHERE (m.home_team_id = :home AND m.away_team_id = :away)
-            ORDER BY m.kickoff_at DESC LIMIT 1
-        """), {"home": req.home_team_id, "away": req.away_team_id}).mappings().first()
-
-    if feat_row is None:
-        feat_values = {c: 0.0 for c in bundle["feature_cols"]}
-    else:
-        feat_values = {c: (feat_row[c] or 0.0) for c in bundle["feature_cols"]}
-
-    X = pd.DataFrame([feat_values])[bundle["feature_cols"]]
-    probs_raw = bundle["model"].predict_proba(X)[0]
-    classes   = list(bundle["model"].classes_)
-    prob_map  = dict(zip(classes, probs_raw))
-
+    ph, pd_, pa = _predict_probs(req.home_team_id, req.away_team_id)
     return PredictResponse(
         home_team_id=req.home_team_id,
         away_team_id=req.away_team_id,
-        prob_home=round(float(prob_map.get("home", 0)), 4),
-        prob_draw=round(float(prob_map.get("draw", 0)), 4),
-        prob_away=round(float(prob_map.get("away", 0)), 4),
+        prob_home=round(ph, 4),
+        prob_draw=round(pd_, 4),
+        prob_away=round(pa, 4),
         model="lgbm_v1",
     )
+
+
+@app.post("/simulate/standings")
+def simulate_standings(req: SimulateRequest):
+    """Simulacion Montecarlo: distribucion de posicion final para un equipo.
+
+    Algoritmo:
+      1. Carga la clasificacion actual (puntos, partidos jugados)
+      2. Obtiene los partidos pendientes de la temporada
+      3. Por cada simulacion, sortea resultados segun probabilidades del modelo
+         y calcula la posicion final de req.team_id
+      4. Devuelve la distribucion de frecuencias de posicion
+    """
+    if load_model() is None:
+        raise HTTPException(503, "Model not available")
+
+    with get_engine().connect() as conn:
+        # Clasificacion actual
+        standing_rows = conn.execute(text("""
+            SELECT t.team_id, s.points, s.goal_difference
+            FROM standings s
+            JOIN teams t ON t.team_id = s.team_id
+            WHERE s.fetched_at = (SELECT MAX(fetched_at) FROM standings)
+        """)).mappings().all()
+
+        # Partidos pendientes de la temporada actual
+        pending_rows = conn.execute(text("""
+            SELECT m.match_id, m.home_team_id, m.away_team_id
+            FROM matches m
+            WHERE m.status = 'Scheduled'
+              AND m.competition_main = TRUE
+            ORDER BY m.kickoff_at
+        """)).mappings().all()
+
+    if not standing_rows:
+        raise HTTPException(404, "No hay clasificacion disponible")
+
+    # Probabilidades para todos los partidos pendientes (calculadas una vez)
+    match_probs = {}
+    for m in pending_rows:
+        ph, pd_, pa = _predict_probs(m["home_team_id"], m["away_team_id"])
+        match_probs[m["match_id"]] = {
+            "home_id": m["home_team_id"],
+            "away_id": m["away_team_id"],
+            "probs":   [ph, pd_, pa],  # home win, draw, away win
+        }
+
+    base_points = {r["team_id"]: r["points"] for r in standing_rows}
+    base_gd     = {r["team_id"]: r["goal_difference"] for r in standing_rows}
+    all_teams   = list(base_points.keys())
+
+    position_counts: dict[int, int] = defaultdict(int)
+    N = min(req.simulations, 20000)
+
+    for _ in range(N):
+        pts = dict(base_points)
+        gd  = dict(base_gd)
+
+        for mp in match_probs.values():
+            ph, pd_, pa = mp["probs"]
+            outcome = random.choices(["home", "draw", "away"], weights=[ph, pd_, pa])[0]
+            h, a = mp["home_id"], mp["away_id"]
+            if outcome == "home":
+                pts[h] = pts.get(h, 0) + 3
+                gd[h]  = gd.get(h, 0)  + 1
+                gd[a]  = gd.get(a, 0)  - 1
+            elif outcome == "draw":
+                pts[h] = pts.get(h, 0) + 1
+                pts[a] = pts.get(a, 0) + 1
+            else:
+                pts[a] = pts.get(a, 0) + 3
+                gd[a]  = gd.get(a, 0)  + 1
+                gd[h]  = gd.get(h, 0)  - 1
+
+        # Ordenar por puntos desc, luego GD desc
+        ranked = sorted(all_teams,
+                        key=lambda t: (pts.get(t, 0), gd.get(t, 0)),
+                        reverse=True)
+        pos = ranked.index(req.team_id) + 1 if req.team_id in ranked else 20
+        position_counts[pos] += 1
+
+    distribution = {str(pos): round(cnt / N, 4)
+                    for pos, cnt in sorted(position_counts.items())}
+
+    return {
+        "team_id":              req.team_id,
+        "simulations":          N,
+        "position_distribution": distribution,
+    }
