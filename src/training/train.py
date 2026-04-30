@@ -14,7 +14,7 @@ Seleccion de modelo:
   de features (determinado por cobertura en train, ver _available()).
 
 Features activas:
-  D - ELO:         home_elo, away_elo  (diferencial implicito; nivel absoluto)
+  D - ELO:         elo_diff  (absolutos redundantes con standings en ELO cold-start)
   A - Standings:   home/away_points_total, home/away_table_position,
                    home/away_gd_total
   B - Forma:       home/away_goals_for/against_last5
@@ -48,8 +48,8 @@ logger = logging.getLogger(__name__)
 OPTA_THRESHOLD = 0.10
 
 BASE_COLS = [
-    # D: ELO — absolutos por equipo (el diferencial queda implicito)
-    "home_elo", "away_elo",
+    # D: ELO diferencial (absolutos redundantes con standings dado cold-start desde 1500)
+    "elo_diff",
     # A: Estado competitivo
     "home_points_total", "away_points_total",
     "home_table_position", "away_table_position",
@@ -310,7 +310,7 @@ if __name__ == "__main__":
         matches = pd.read_sql(sqlt("""
             SELECT
                 m.match_id, m.season_id, m.result,
-                f.home_elo, f.away_elo,
+                f.elo_diff,
                 f.home_points_total,    f.away_points_total,
                 f.home_table_position,  f.away_table_position,
                 f.home_gd_total,        f.away_gd_total,
