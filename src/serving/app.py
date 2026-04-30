@@ -36,6 +36,12 @@ app = FastAPI(
 _model_bundle: dict | None = None
 _engine = None
 
+# Subconsulta reutilizable: equipos de Primera Division (clasificacion actual)
+_PRIMERA_TEAMS_SUBQUERY = """
+    SELECT team_id FROM standings
+    WHERE fetched_at = (SELECT MAX(fetched_at) FROM standings)
+"""
+
 
 def get_engine():
     global _engine
@@ -63,7 +69,7 @@ def startup():
     load_model()
 
 
-# ── Schemas ─────────────────────────────────────────────────────
+# ── Schemas ──────────────────────────────────────────────────────────────────
 
 class PredictRequest(BaseModel):
     home_team_id: int
@@ -85,7 +91,7 @@ class SimulateRequest(BaseModel):
     simulations: int = 5000
 
 
-# ── Helpers ─────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _predict_probs(home_id: int, away_id: int) -> tuple[float, float, float]:
     """Devuelve (prob_home, prob_draw, prob_away) para un partido."""
@@ -124,7 +130,7 @@ def _predict_probs(home_id: int, away_id: int) -> tuple[float, float, float]:
     )
 
 
-# ── Endpoints ─────────────────────────────────────────────────────
+# ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
@@ -158,9 +164,9 @@ def standings():
 
 @app.get("/matches/upcoming")
 def upcoming_matches(limit: int = 10):
-    """Partidos proximos: filtra por result IS NULL."""
+    """Partidos proximos de Primera Division (ambos equipos en standings actual)."""
     with get_engine().connect() as conn:
-        rows = conn.execute(text("""
+        rows = conn.execute(text(f"""
             SELECT m.match_id, m.kickoff_at, m.gameweek_week,
                    m.home_team_id, m.away_team_id,
                    ht.name AS home_team, at2.name AS away_team
@@ -169,6 +175,8 @@ def upcoming_matches(limit: int = 10):
             JOIN teams at2 ON at2.team_id = m.away_team_id
             WHERE m.result IS NULL
               AND m.competition_main = TRUE
+              AND m.home_team_id IN ({_PRIMERA_TEAMS_SUBQUERY})
+              AND m.away_team_id IN ({_PRIMERA_TEAMS_SUBQUERY})
             ORDER BY m.kickoff_at
             LIMIT :limit
         """), {"limit": limit}).mappings().all()
@@ -177,9 +185,9 @@ def upcoming_matches(limit: int = 10):
 
 @app.get("/matches/by-jornada")
 def matches_by_jornada(jornada: int):
-    """Partidos de una jornada: filtra por result IS NULL."""
+    """Partidos de una jornada de Primera Division."""
     with get_engine().connect() as conn:
-        rows = conn.execute(text("""
+        rows = conn.execute(text(f"""
             SELECT m.match_id, m.kickoff_at, m.gameweek_week,
                    m.home_team_id, m.away_team_id,
                    ht.name AS home_team, at2.name AS away_team
@@ -189,6 +197,8 @@ def matches_by_jornada(jornada: int):
             WHERE m.gameweek_week = :jornada
               AND m.result IS NULL
               AND m.competition_main = TRUE
+              AND m.home_team_id IN ({_PRIMERA_TEAMS_SUBQUERY})
+              AND m.away_team_id IN ({_PRIMERA_TEAMS_SUBQUERY})
             ORDER BY m.kickoff_at
         """), {"jornada": jornada}).mappings().all()
     return {"matches": [dict(r) for r in rows]}
@@ -213,8 +223,10 @@ def predict(req: PredictRequest):
 def simulate_standings(req: SimulateRequest):
     """Simulacion Montecarlo: distribucion de posicion final para un equipo.
 
+    Solo considera partidos entre equipos de Primera Division (standings actual).
+
     Campos de respuesta:
-      pending_matches_count  -> total de partidos pendientes en la liga
+      pending_matches_count  -> partidos pendientes de Primera Division
       team_pending_count     -> partidos pendientes del equipo solicitado
       season_complete        -> True si no quedan partidos
     """
@@ -229,18 +241,21 @@ def simulate_standings(req: SimulateRequest):
             WHERE s.fetched_at = (SELECT MAX(fetched_at) FROM standings)
         """)).mappings().all()
 
-        pending_rows = conn.execute(text("""
+        # Solo partidos donde AMBOS equipos esten en la clasificacion actual
+        pending_rows = conn.execute(text(f"""
             SELECT m.match_id, m.home_team_id, m.away_team_id
             FROM matches m
             WHERE m.result IS NULL
               AND m.competition_main = TRUE
+              AND m.home_team_id IN ({_PRIMERA_TEAMS_SUBQUERY})
+              AND m.away_team_id IN ({_PRIMERA_TEAMS_SUBQUERY})
             ORDER BY m.kickoff_at
         """)).mappings().all()
 
     if not standing_rows:
         raise HTTPException(404, "No hay clasificacion disponible")
 
-    pending_list = list(pending_rows)
+    pending_list  = list(pending_rows)
     pending_count = len(pending_list)
 
     # Partidos pendientes que involucran al equipo solicitado
