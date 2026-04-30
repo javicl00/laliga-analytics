@@ -41,7 +41,6 @@ st.markdown("""
 
 # ── Zonas LaLiga ──────────────────────────────────────────────────────────
 
-# (pos_min, pos_max_incl, label, bar_color, bg_color)
 ZONAS = [
     (1,  4,  "🔵 Champions League",  "#1d6fa4", "#1d6fa4"),
     (5,  5,  "🟠 Europa League",      "#e07b00", "#e07b00"),
@@ -52,7 +51,6 @@ ZONAS = [
 
 
 def zona_para(pos: int) -> tuple[str, str]:
-    """Devuelve (label, bar_color) para una posicion."""
     for pmin, pmax, label, color, _ in ZONAS:
         if pmin <= pos <= pmax:
             return label, color
@@ -62,10 +60,18 @@ def zona_para(pos: int) -> tuple[str, str]:
 # ── Helpers ───────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=300)
-def get_teams():
-    r = requests.get(f"{API}/teams", timeout=5)
+def get_primera_teams():
+    """Devuelve solo los 20 equipos actuales de Primera Division,
+    obtenidos desde /standings (no incluye equipos de otras categorias).
+    """
+    r = requests.get(f"{API}/standings", timeout=5)
     r.raise_for_status()
-    return r.json()["teams"]
+    rows = r.json()["standings"]
+    # Ordenar alfabeticamente para el selector
+    return sorted(
+        [{"team_id": s["team_id"], "name": s["name"]} for s in rows],
+        key=lambda t: t["name"],
+    )
 
 
 @st.cache_data(ttl=60)
@@ -134,24 +140,21 @@ def standings_chart(dist: dict, team_name: str) -> go.Figure:
     colors = [zona_para(p)[1] for p in positions]
 
     fig = go.Figure(go.Bar(
-        x=positions,
-        y=probs,
+        x=positions, y=probs,
         marker_color=colors,
         text=[f"{v:.1f}%" if v >= 2 else "" for v in probs],
         textposition="outside",
     ))
 
-    # Bandas de fondo por zona
     bg_zones = [
-        (0.5,  4.5,  "#1d6fa4"),  # Champions
-        (4.5,  5.5,  "#e07b00"),  # Europa League
-        (5.5,  7.5,  "#b5a000"),  # Conference
-        (17.5, 20.5, "#e63946"),  # Descenso
+        (0.5,  4.5,  "#1d6fa4"),
+        (4.5,  5.5,  "#e07b00"),
+        (5.5,  7.5,  "#b5a000"),
+        (17.5, 20.5, "#e63946"),
     ]
     for x0, x1, color in bg_zones:
         fig.add_vrect(x0=x0, x1=x1, fillcolor=color, opacity=0.08, line_width=0)
 
-    # Etiquetas de zona en el eje X
     annotations = [
         dict(x=2.5,  y=1.06, text="UCL",  showarrow=False, xref="x", yref="paper",
              font=dict(size=10, color="#1d6fa4"), xanchor="center"),
@@ -193,8 +196,6 @@ with st.sidebar:
     )
     st.markdown("---")
     st.caption("Modelo: LightGBM | RPS val: 0.2019")
-
-    # Leyenda de zonas
     st.markdown("---")
     st.markdown("**Zonas**")
     for _, _, label, color, _ in ZONAS:
@@ -313,9 +314,10 @@ if seccion == "📅 Predicción por Jornada":
 
 elif seccion == "🔮 Partido Individual":
     st.title("🔮 Predicción Partido Individual")
+    st.caption("🏆 Solo se muestran los 20 equipos actuales de Primera División")
 
     try:
-        teams = get_teams()
+        teams = get_primera_teams()
     except Exception as e:
         st.error(f"No se pudo conectar con la API: {e}")
         st.stop()
@@ -346,7 +348,6 @@ elif seccion == "🔮 Partido Individual":
                 c1.metric(f"🟢 {home_name}", f"{p['prob_home']*100:.1f}%")
                 c2.metric("🟡 Empate",        f"{p['prob_draw']*100:.1f}%")
                 c3.metric(f"🔴 {away_name}",  f"{p['prob_away']*100:.1f}%")
-
                 ganador = (
                     home_name if p["prob_home"] > max(p["prob_draw"], p["prob_away"])
                     else ("Empate" if p["prob_draw"] > p["prob_away"] else away_name)
@@ -365,7 +366,7 @@ else:
     st.caption("Simulación Montecarlo sobre los partidos pendientes de la temporada.")
 
     try:
-        teams = get_teams()
+        teams = get_primera_teams()
     except Exception as e:
         st.error(f"No se pudo conectar con la API: {e}")
         st.stop()
@@ -408,23 +409,17 @@ else:
                     config={"displayModeBar": False},
                 )
 
-                # Tabla de posiciones con zona
                 rows = []
                 for pos in range(1, 21):
                     prob = dist.get(str(pos), 0) * 100
                     if prob >= 0.5:
                         label, _ = zona_para(pos)
-                        rows.append({
-                            "Posición":    pos,
-                            "Probabilidad": f"{prob:.1f}%",
-                            "Zona":         label,
-                        })
+                        rows.append({"Posición": pos, "Probabilidad": f"{prob:.1f}%", "Zona": label})
 
                 if rows:
                     st.markdown("#### Posiciones con probabilidad ≥ 0.5%")
                     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-                # Métricas por zona
                 if not season_complete:
                     c1, c2, c3, c4, c5 = st.columns(5)
                     c1.metric("🔵 Champions (1-4)",
