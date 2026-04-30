@@ -10,18 +10,27 @@ Flujo de extraccion basado en endpoints reales verificados (HAR 2025-04-30):
                      -> partidos CON home_score/away_score incluidos
                         Paralelizado con ThreadPoolExecutor (workers=6)
 
-Slugs verificados (2025-04-30):
-  2021-22  laliga-santander-2021   id=116
-  2022-23  laliga-santander-2022   id=305
-  2023-24  laliga-easports-2023    id=329
-  2024-25  laliga-easports-2024    id=351
-  2025-26  laliga-easports-2025    id=375  (temporada en curso)
+Slugs verificados canonicamente via GET /subscriptions (2026-04-30):
+  id=1    laliga-santander-2013   2013-2014
+  id=10   laliga-santander-2014   2014-2015
+  id=19   laliga-santander-2015   2015-2016
+  id=30   laliga-santander-2016   2016-2017
+  id=41   laliga-santander-2017   2017-2018
+  id=56   laliga-santander-2018   2018-2019
+  id=82   laliga-santander-2019   2019-2020
+  id=97   laliga-santander-2020   2020-2021
+  id=116  laliga-santander-2021   2021-2022
+  id=305  laliga-santander-2022   2022-2023
+  id=329  laliga-easports-2023    2023-2024
+  id=351  laliga-easports-2024    2024-2025
+  id=375  laliga-easports-2025    2025-2026  (en curso)
 
 Descartado definitivamente:
   x /subscriptions/{slug}/results     -> 404
   x /matches?subscriptionId=...       -> funciona pero SIN scores
   x /matches/{id}                     -> 404
-  x laliga-easports-2022              -> 404 (era LaLiga Santander ese año)
+  x laliga-easports-2022              -> no existe (era LaLiga Santander ese año)
+  x Datos anteriores a 2013           -> no disponibles en la API
 """
 from __future__ import annotations
 
@@ -42,13 +51,21 @@ logger = logging.getLogger(__name__)
 
 MAX_WORKERS = 6
 
-# Mapa completo de temporadas verificadas
+# Mapa canónico completo verificado via GET /subscriptions (competition.id=1)
 KNOWN_SEASONS = [
-    {"label": "2021", "slug": "laliga-santander-2021"},
-    {"label": "2022", "slug": "laliga-santander-2022"},
-    {"label": "2023", "slug": "laliga-easports-2023"},
-    {"label": "2024", "slug": "laliga-easports-2024"},
-    {"label": "2025", "slug": "laliga-easports-2025"},
+    {"label": "2013", "slug": "laliga-santander-2013", "sub_id": 1},
+    {"label": "2014", "slug": "laliga-santander-2014", "sub_id": 10},
+    {"label": "2015", "slug": "laliga-santander-2015", "sub_id": 19},
+    {"label": "2016", "slug": "laliga-santander-2016", "sub_id": 30},
+    {"label": "2017", "slug": "laliga-santander-2017", "sub_id": 41},
+    {"label": "2018", "slug": "laliga-santander-2018", "sub_id": 56},
+    {"label": "2019", "slug": "laliga-santander-2019", "sub_id": 82},
+    {"label": "2020", "slug": "laliga-santander-2020", "sub_id": 97},
+    {"label": "2021", "slug": "laliga-santander-2021", "sub_id": 116},
+    {"label": "2022", "slug": "laliga-santander-2022", "sub_id": 305},
+    {"label": "2023", "slug": "laliga-easports-2023",  "sub_id": 329},
+    {"label": "2024", "slug": "laliga-easports-2024",  "sub_id": 351},
+    {"label": "2025", "slug": "laliga-easports-2025",  "sub_id": 375},
 ]
 
 
@@ -204,7 +221,7 @@ if __name__ == "__main__":
         "--season",
         choices=[s["label"] for s in KNOWN_SEASONS] + ["all"],
         default="all",
-        help="Temporada a extraer (2021-2025) o 'all' para todas (default: all)",
+        help="Temporada a extraer (2013-2025) o 'all' para todas (default: all)",
     )
     args = parser.parse_args()
 
