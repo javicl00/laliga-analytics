@@ -126,10 +126,9 @@ class PostgresRawRepository:
         logger.info("Inserted %d standing rows", len(rows))
 
     def upsert_match_features(self, rows: List[Dict]) -> None:
-        """Upsert de features ricas v2 (schema match_features v2).
+        """Upsert de features ricas v2.1 (22 features + H2H).
 
-        Columnas esperadas en cada dict: match_id + las 19 de FEATURE_COLUMNS
-        definidas en src/features/build_features.py.
+        Columnas esperadas: match_id + FEATURE_COLUMNS de build_features.py.
         """
         sql = text("""
             INSERT INTO match_features (
@@ -141,7 +140,8 @@ class PostgresRawRepository:
                 home_goals_for_last5, home_goals_against_last5,
                 away_goals_for_last5, away_goals_against_last5,
                 gameweek, home_rest_days, away_rest_days,
-                home_pressure_index, away_pressure_index
+                home_pressure_index, away_pressure_index,
+                h2h_home_wins, h2h_draws, h2h_away_wins
             ) VALUES (
                 :match_id,
                 :home_elo, :away_elo, :elo_diff,
@@ -151,7 +151,8 @@ class PostgresRawRepository:
                 :home_goals_for_last5, :home_goals_against_last5,
                 :away_goals_for_last5, :away_goals_against_last5,
                 :gameweek, :home_rest_days, :away_rest_days,
-                :home_pressure_index, :away_pressure_index
+                :home_pressure_index, :away_pressure_index,
+                :h2h_home_wins, :h2h_draws, :h2h_away_wins
             )
             ON CONFLICT (match_id) DO UPDATE SET
                 home_elo=EXCLUDED.home_elo,
@@ -173,6 +174,9 @@ class PostgresRawRepository:
                 away_rest_days=EXCLUDED.away_rest_days,
                 home_pressure_index=EXCLUDED.home_pressure_index,
                 away_pressure_index=EXCLUDED.away_pressure_index,
+                h2h_home_wins=EXCLUDED.h2h_home_wins,
+                h2h_draws=EXCLUDED.h2h_draws,
+                h2h_away_wins=EXCLUDED.h2h_away_wins,
                 computed_at=now()
         """)
         with self.engine.begin() as conn:

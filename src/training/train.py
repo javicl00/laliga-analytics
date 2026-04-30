@@ -1,20 +1,21 @@
 """Entrenamiento del modelo de prediccion (baseline + LightGBM).
 
-Validacion walk-forward (sin data leakage temporal):
-  - Train: J1  → J25
-  - Val:   J26 → J30
-  - Test:  J31 → J33  (held-out)
+Validacion walk-forward por temporada (sin data leakage temporal):
+  - Train: todas las temporadas excepto las 2 ultimas
+  - Val:   penultima temporada completa
+  - Test:  ultima temporada (puede ser parcial si la actual esta en curso)
 
 Metrica principal: RPS (Ranked Probability Score).
 El modelo entrenado se guarda en models/lgbm_v1.pkl.
 
-Features activas (17 columnas):
-  - ELO dinamico:       home_elo, away_elo, elo_diff
-  - Estado competitivo: home/away_points_total, home/away_table_position,
-                        position_diff, home/away_gd_total
-  - Forma reciente:     home/away_goals_for/against_last5
-  - Contexto:           home_rest_days, away_rest_days,
-                        home/away_pressure_index, gameweek
+Features activas (22 columnas):
+  D - ELO:         home_elo, away_elo, elo_diff
+  A - Standings:   home/away_points_total, home/away_table_position,
+                   position_diff, home/away_gd_total
+  B - Forma:       home/away_goals_for/against_last5
+  E - Contexto:    home_rest_days, away_rest_days,
+                   home/away_pressure_index, gameweek
+  F - H2H:         h2h_home_wins, h2h_draws, h2h_away_wins
 """
 from __future__ import annotations
 
@@ -22,7 +23,7 @@ import logging
 import os
 import pickle
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -35,23 +36,24 @@ from sklearn.preprocessing import StandardScaler
 logger = logging.getLogger(__name__)
 
 FEATURE_COLS = [
-    # Familia D: ELO dinamico
+    # D: ELO dinamico
     "home_elo", "away_elo", "elo_diff",
-    # Familia A: Estado competitivo
+    # A: Estado competitivo
     "home_points_total", "away_points_total",
     "home_table_position", "away_table_position", "position_diff",
     "home_gd_total", "away_gd_total",
-    # Familia B: Forma reciente (ultimos 5 partidos)
+    # B: Forma reciente (ultimos 5, todos los campos)
     "home_goals_for_last5",   "home_goals_against_last5",
     "away_goals_for_last5",   "away_goals_against_last5",
-    # Familia E: Contexto
+    # E: Contexto
     "home_rest_days", "away_rest_days",
     "home_pressure_index", "away_pressure_index",
     "gameweek",
+    # F: Head-to-Head
+    "h2h_home_wins", "h2h_draws", "h2h_away_wins",
 ]
-TARGET_COL = "result"   # home | draw | away
-CLASSES    = ["home", "draw", "away"]
-# Orden lexicografico que espera sklearn.metrics.log_loss
+TARGET_COL  = "result"   # home | draw | away
+CLASSES     = ["home", "draw", "away"]
 _CLASSES_LEX = sorted(CLASSES)   # ['away', 'draw', 'home']
 
 
@@ -60,10 +62,7 @@ _CLASSES_LEX = sorted(CLASSES)   # ['away', 'draw', 'home']
 # ──────────────────────────────────────────────────────────
 
 def rps(y_true: np.ndarray, probs: np.ndarray) -> float:
-    """Ranked Probability Score (menor es mejor).
-
-    probs debe tener columnas en el orden de CLASSES = ['home','draw','away'].
-    """
+    """Ranked Probability Score (menor es mejor)."""
     n = probs.shape[0]
     if n == 0:
         return float("nan")
@@ -79,25 +78,47 @@ def rps(y_true: np.ndarray, probs: np.ndarray) -> float:
 
 
 def _reorder_probs(model, probs: np.ndarray) -> np.ndarray:
-    """Reordena columnas de probs al orden canonico de CLASSES."""
     classes: List[str] = list(model.classes_)
-    col_order = [classes.index(c) for c in CLASSES]
-    return probs[:, col_order]
+    return probs[:, [classes.index(c) for c in CLASSES]]
 
 
 # ──────────────────────────────────────────────────────────
-# Splits temporales
+# Split walk-forward por temporada
 # ──────────────────────────────────────────────────────────
 
 def temporal_split(
     df: pd.DataFrame,
-    train_end_week: int = 25,
-    val_end_week:   int = 30,
+    val_season: Optional[int] = None,
+    test_season: Optional[int] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    train = df[df["gameweek_week"] <= train_end_week]
-    val   = df[(df["gameweek_week"] > train_end_week) & (df["gameweek_week"] <= val_end_week)]
-    test  = df[df["gameweek_week"] > val_end_week]
-    logger.info("Split: train=%d val=%d test=%d", len(train), len(val), len(test))
+    """Walk-forward split por temporada completa.
+
+    Por defecto: test=ultima temporada, val=penultima, train=el resto.
+    Evita la contaminacion del split anterior que mezclaba jornadas
+    de distintas temporadas al filtrar por gameweek_week.
+    """
+    seasons = sorted(df["season_id"].dropna().unique().tolist())
+    logger.info("Temporadas disponibles: %s", seasons)
+
+    if len(seasons) < 2:
+        raise ValueError(f"Se necesitan al menos 2 temporadas completas, hay {len(seasons)}")
+
+    if test_season is None:
+        test_season = seasons[-1]
+    if val_season is None:
+        val_season = seasons[-2]
+
+    train_seasons = [s for s in seasons if s not in (val_season, test_season)]
+    train = df[df["season_id"].isin(train_seasons)]
+    val   = df[df["season_id"] == val_season]
+    test  = df[df["season_id"] == test_season]
+
+    logger.info(
+        "Split: train=%d (T:%s) | val=%d (T:%s) | test=%d (T:%s)",
+        len(train), train_seasons,
+        len(val),   val_season,
+        len(test),  test_season,
+    )
     return train, val, test
 
 
@@ -106,10 +127,8 @@ def temporal_split(
 # ──────────────────────────────────────────────────────────
 
 def baseline_probs(train: pd.DataFrame, n: int) -> np.ndarray:
-    """Predice siempre la distribucion marginal del conjunto de entrenamiento."""
     counts = train[TARGET_COL].value_counts(normalize=True).to_dict()
-    prob = [counts.get(c, 0.0) for c in CLASSES]
-    return np.tile(prob, (n, 1))
+    return np.tile([counts.get(c, 0.0) for c in CLASSES], (n, 1))
 
 
 # ──────────────────────────────────────────────────────────
@@ -135,34 +154,22 @@ def train_lgbm(train: pd.DataFrame) -> LGBMClassifier:
 def train_logistic(train: pd.DataFrame) -> Pipeline:
     X = train[FEATURE_COLS].fillna(0)
     y = train[TARGET_COL]
-    pipeline = Pipeline([
+    return Pipeline([
         ("scaler", StandardScaler()),
-        ("lr", LogisticRegression(
-            max_iter=1000,
-            class_weight="balanced",
-            random_state=42,
-        )),
-    ])
-    pipeline.fit(X, y)
-    return pipeline
+        ("lr", LogisticRegression(max_iter=1000, class_weight="balanced", random_state=42)),
+    ]).fit(X, y)
 
 
 # ──────────────────────────────────────────────────────────
 # Evaluacion
 # ──────────────────────────────────────────────────────────
 
-def evaluate(
-    model, df: pd.DataFrame, split_name: str = "val"
-) -> Dict[str, float]:
+def evaluate(model, df: pd.DataFrame, split_name: str = "val") -> Dict[str, float]:
     X = df[FEATURE_COLS].fillna(0)
     y = df[TARGET_COL].values
-    raw_probs = model.predict_proba(X)
-    probs = _reorder_probs(model, raw_probs)
-
-    lex_order  = [CLASSES.index(c) for c in _CLASSES_LEX]
-    probs_lex  = probs[:, lex_order]
-
-    metrics = {
+    probs     = _reorder_probs(model, model.predict_proba(X))
+    probs_lex = probs[:, [CLASSES.index(c) for c in _CLASSES_LEX]]
+    metrics   = {
         "rps":      rps(y, probs),
         "log_loss": log_loss(y, probs_lex, labels=_CLASSES_LEX),
     }
@@ -177,27 +184,25 @@ def evaluate(
 def run(
     features_df: pd.DataFrame,
     output_dir: str = "models",
-    train_end_week: int = 25,
-    val_end_week:   int = 30,
+    val_season: Optional[int] = None,
+    test_season: Optional[int] = None,
 ) -> Dict:
     df = features_df.dropna(subset=[TARGET_COL])
-    train, val, test = temporal_split(df, train_end_week, val_end_week)
+    train, val, test = temporal_split(df, val_season, test_season)
 
     if train.empty or val.empty:
         raise ValueError(
             f"Split insuficiente: train={len(train)} val={len(val)}. "
-            "Verifica que el JOIN matches+match_features tiene result IS NOT NULL "
-            "y gameweek_week poblado."
+            "Necesitas al menos 2 temporadas con result IS NOT NULL."
         )
 
-    base_probs_arr = baseline_probs(train, len(val))
-    base_rps       = rps(val[TARGET_COL].values, base_probs_arr)
+    base_rps = rps(val[TARGET_COL].values, baseline_probs(train, len(val)))
     logger.info("Baseline RPS (val): %.4f", base_rps)
 
-    lr        = train_logistic(train)
-    lr_metrics = evaluate(lr, val, "logistic_val")
+    lr          = train_logistic(train)
+    lr_metrics  = evaluate(lr, val, "logistic_val")
 
-    lgbm        = train_lgbm(train)
+    lgbm         = train_lgbm(train)
     lgbm_metrics = evaluate(lgbm, val, "lgbm_val")
 
     best_model   = lgbm if lgbm_metrics["rps"] <= lr_metrics["rps"] else lr
@@ -206,19 +211,15 @@ def run(
     Path(output_dir).mkdir(exist_ok=True)
     model_path = Path(output_dir) / "lgbm_v1.pkl"
     with open(model_path, "wb") as f:
-        pickle.dump({
-            "model":        best_model,
-            "feature_cols": FEATURE_COLS,
-            "classes":      CLASSES,
-        }, f)
+        pickle.dump({"model": best_model, "feature_cols": FEATURE_COLS, "classes": CLASSES}, f)
     logger.info("Model saved to %s", model_path)
 
     return {
-        "baseline_rps":  base_rps,
-        "logistic":      lr_metrics,
-        "lgbm":          lgbm_metrics,
-        "test":          test_metrics,
-        "model_path":    str(model_path),
+        "baseline_rps": base_rps,
+        "logistic":     lr_metrics,
+        "lgbm":         lgbm_metrics,
+        "test":         test_metrics,
+        "model_path":   str(model_path),
     }
 
 
@@ -228,7 +229,7 @@ if __name__ == "__main__":
     engine = create_engine(os.environ["DATABASE_URL"])
     with engine.connect() as conn:
         matches = pd.read_sql(sqlt(
-            "SELECT m.match_id, m.gameweek_week, m.result, "
+            "SELECT m.match_id, m.season_id, m.gameweek_week, m.result, "
             "f.home_elo, f.away_elo, f.elo_diff, "
             "f.home_points_total, f.away_points_total, "
             "f.home_table_position, f.away_table_position, f.position_diff, "
@@ -237,7 +238,7 @@ if __name__ == "__main__":
             "f.away_goals_for_last5, f.away_goals_against_last5, "
             "f.home_rest_days, f.away_rest_days, "
             "f.home_pressure_index, f.away_pressure_index, "
-            "f.gameweek "
+            "f.gameweek, f.h2h_home_wins, f.h2h_draws, f.h2h_away_wins "
             "FROM matches m "
             "JOIN match_features f USING (match_id) "
             "WHERE m.competition_main=TRUE AND m.result IS NOT NULL"
