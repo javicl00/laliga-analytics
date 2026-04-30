@@ -118,13 +118,19 @@ def _available(df: pd.DataFrame) -> List[str]:
 
 
 def _X_lgbm(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
-    """Features para LightGBM: NaN nativo (sin fillna)."""
-    return df[cols]
+    """Features para LightGBM: float64 con NaN nativo (sin fillna).
+
+    Aplica pd.to_numeric(errors='coerce') para convertir columnas que
+    lleguen como dtype object (p.ej. columnas recien migradas con todos
+    los valores NULL que pandas infiere como object en lugar de float64).
+    LightGBM maneja NaN de forma nativa.
+    """
+    return df[cols].apply(pd.to_numeric, errors="coerce")
 
 
 def _X_sklearn(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
-    """Features para sklearn: fillna(0) porque Pipeline no tolera NaN."""
-    return df[cols].fillna(0)
+    """Features para sklearn: float64 con fillna(0) porque Pipeline no tolera NaN."""
+    return df[cols].apply(pd.to_numeric, errors="coerce").fillna(0)
 
 
 # ────────────────────────────────────────────────────────────
@@ -272,8 +278,6 @@ def run(
     lgbm_metrics = evaluate(lgbm, val, "lgbm_val")
 
     # Seleccion dinamica: gana el modelo con menor RPS en val.
-    # La comparacion es justa porque _available() usa el mismo conjunto
-    # de features para ambos (Opta excluida si cobertura < OPTA_THRESHOLD).
     if lgbm_metrics["rps"] <= lr_metrics["rps"]:
         best_model  = lgbm
         winner_name = "LightGBM"
