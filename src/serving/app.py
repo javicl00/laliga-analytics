@@ -1,7 +1,7 @@
 """API REST para predicciones de partidos LaLiga.
 
 Endpoints:
-  GET  /health               -> {status: ok}
+  GET  /health               -> {status: ok, model_loaded: bool}
   GET  /matches/upcoming     -> partidos proximos con predicciones
   POST /predict              -> prediccion para un partido concreto
   GET  /standings            -> clasificacion actual
@@ -28,7 +28,7 @@ app = FastAPI(
     version="0.1.0-beta",
 )
 
-# ── Estado global ─────────────────────────────────────────────────────────────
+# -- Estado global -------------------------------------------------------------
 _model_bundle: dict | None = None
 _engine = None
 
@@ -41,6 +41,9 @@ def get_engine():
 
 
 def load_model():
+    """Carga lazy: intenta cargar el modelo si aun no esta en memoria.
+    Seguro para llamar multiples veces (no-op si ya esta cargado).
+    """
     global _model_bundle
     if _model_bundle is None:
         path = Path("models/lgbm_v1.pkl")
@@ -55,10 +58,11 @@ def load_model():
 
 @app.on_event("startup")
 def startup():
-    load_model()
+    get_engine()   # pre-warm conexion a BD
+    load_model()   # intento inicial (puede fallar si aun no existe el .pkl)
 
 
-# ── Schemas ───────────────────────────────────────────────────────────────────
+# -- Schemas -------------------------------------------------------------------
 
 class PredictRequest(BaseModel):
     home_team_id: int
@@ -75,10 +79,15 @@ class PredictResponse(BaseModel):
     model: str
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
+# -- Endpoints -----------------------------------------------------------------
 
 @app.get("/health")
 def health():
+    """Intenta carga lazy del modelo en cada llamada si no esta disponible.
+    Permite que la API detecte automaticamente un modelo recien entrenado
+    sin necesidad de reiniciar el contenedor.
+    """
+    load_model()
     return {"status": "ok", "model_loaded": _model_bundle is not None}
 
 
