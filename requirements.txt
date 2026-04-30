@@ -10,6 +10,7 @@ pandas>=2.2
 numpy>=1.26
 scikit-learn>=1.4
 lightgbm>=4.3
+scipy>=1.13          # Dixon-Coles: optimizacion MLE y distribucion Poisson
 
 # API serving
 fastapi>=0.111
@@ -19,6 +20,8 @@ pydantic>=2.7
 # Config
 python-dotenv>=1.0
 pyyaml>=6.0
+pytz>=2024.1          # Scheduler: zonas horarias
+schedule>=1.2          # Scheduler: cron en Python
 
 # Tests
 pytest>=8.0

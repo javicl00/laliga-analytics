@@ -1,0 +1,118 @@
+{
+  "__inputs": [],
+  "annotations": {"list": []},
+  "description": "LaLiga Analytics - Metricas de temporada",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": {"type": "postgres", "uid": "laliga-pg"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "custom": {"align": "auto", "cellOptions": {"type": "auto"}, "filterable": false, "inspect": false}
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "Pts"}, "properties": [{"id": "custom.width", "value": 55}]},
+          {"matcher": {"id": "byName", "options": "Pos"}, "properties": [{"id": "custom.width", "value": 45}]},
+          {"matcher": {"id": "byName", "options": "Equipo"}, "properties": [{"id": "custom.width", "value": 170}]}
+        ]
+      },
+      "gridPos": {"h": 18, "w": 11, "x": 0, "y": 0},
+      "id": 1,
+      "options": {"cellHeight": "sm", "footer": {"show": false}, "showHeader": true},
+      "title": "\ud83c\udfc6 Clasificaci\u00f3n actual",
+      "type": "table",
+      "targets": [
+        {
+          "datasource": {"type": "postgres", "uid": "laliga-pg"},
+          "rawSql": "SELECT s.position AS \"Pos\", t.name AS \"Equipo\", s.points AS \"Pts\", s.played AS \"PJ\", s.won AS \"G\", s.drawn AS \"E\", s.lost AS \"P\", s.goals_for AS \"GF\", s.goals_against AS \"GC\", s.goal_difference AS \"DG\" FROM standings s JOIN teams t ON t.team_id = s.team_id WHERE s.fetched_at = (SELECT MAX(fetched_at) FROM standings) ORDER BY s.position",
+          "format": "table",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {"type": "postgres", "uid": "laliga-pg"},
+      "fieldConfig": {
+        "defaults": {"color": {"fixedColor": "blue", "mode": "fixed"}, "custom": {"fillOpacity": 70, "lineWidth": 1}},
+        "overrides": []
+      },
+      "gridPos": {"h": 9, "w": 13, "x": 11, "y": 0},
+      "id": 2,
+      "options": {
+        "barWidth": 0.7,
+        "groupWidth": 0.7,
+        "legend": {"displayMode": "hidden", "placement": "bottom"},
+        "orientation": "auto",
+        "xField": "Jornada"
+      },
+      "title": "\u26bd Goles por Jornada (media por partido)",
+      "type": "barchart",
+      "targets": [
+        {
+          "datasource": {"type": "postgres", "uid": "laliga-pg"},
+          "rawSql": "SELECT gameweek_week AS \"Jornada\", ROUND(AVG(home_score + away_score)::numeric, 2) AS \"Media goles\" FROM matches WHERE result IS NOT NULL AND competition_main = TRUE AND home_team_id IN (SELECT team_id FROM standings WHERE fetched_at = (SELECT MAX(fetched_at) FROM standings)) GROUP BY gameweek_week ORDER BY gameweek_week",
+          "format": "table",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {"type": "postgres", "uid": "laliga-pg"},
+      "fieldConfig": {
+        "defaults": {"color": {"mode": "palette-classic"}, "custom": {}},
+        "overrides": []
+      },
+      "gridPos": {"h": 9, "w": 7, "x": 11, "y": 9},
+      "id": 3,
+      "options": {
+        "displayLabels": ["name", "percent"],
+        "legend": {"displayMode": "table", "placement": "right", "values": ["value", "percent"]},
+        "pieType": "pie"
+      },
+      "title": "\ud83d\udcca Distribuci\u00f3n de resultados",
+      "type": "piechart",
+      "targets": [
+        {
+          "datasource": {"type": "postgres", "uid": "laliga-pg"},
+          "rawSql": "SELECT 'Victoria local' AS result, COUNT(*)::float AS total FROM matches WHERE result = 'home' AND competition_main = TRUE AND home_team_id IN (SELECT team_id FROM standings WHERE fetched_at = (SELECT MAX(fetched_at) FROM standings)) UNION ALL SELECT 'Empate', COUNT(*) FROM matches WHERE result = 'draw' AND competition_main = TRUE AND home_team_id IN (SELECT team_id FROM standings WHERE fetched_at = (SELECT MAX(fetched_at) FROM standings)) UNION ALL SELECT 'Victoria visit.', COUNT(*) FROM matches WHERE result = 'away' AND competition_main = TRUE AND home_team_id IN (SELECT team_id FROM standings WHERE fetched_at = (SELECT MAX(fetched_at) FROM standings))",
+          "format": "table",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {"type": "postgres", "uid": "laliga-pg"},
+      "fieldConfig": {
+        "defaults": {"color": {"mode": "thresholds"}, "custom": {"align": "auto", "cellOptions": {"type": "auto"}}},
+        "overrides": []
+      },
+      "gridPos": {"h": 9, "w": 6, "x": 18, "y": 9},
+      "id": 4,
+      "options": {"cellHeight": "sm", "footer": {"show": false}, "showHeader": true},
+      "title": "\ud83d\udd50 \u00daltimos partidos",
+      "type": "table",
+      "targets": [
+        {
+          "datasource": {"type": "postgres", "uid": "laliga-pg"},
+          "rawSql": "SELECT TO_CHAR(m.kickoff_at, 'DD/MM') AS \"Fecha\", ht.shortname AS \"Local\", m.home_score::text || '-' || m.away_score::text AS \"Res\", at2.shortname AS \"Visit.\" FROM matches m JOIN teams ht ON ht.team_id = m.home_team_id JOIN teams at2 ON at2.team_id = m.away_team_id WHERE m.result IS NOT NULL AND m.competition_main = TRUE AND m.home_team_id IN (SELECT team_id FROM standings WHERE fetched_at = (SELECT MAX(fetched_at) FROM standings)) ORDER BY m.kickoff_at DESC LIMIT 10",
+          "format": "table",
+          "refId": "A"
+        }
+      ]
+    }
+  ],
+  "refresh": "5m",
+  "schemaVersion": 38,
+  "tags": ["laliga", "futbol", "analytics"],
+  "time": {"from": "now-6M", "to": "now"},
+  "timepicker": {},
+  "timezone": "Europe/Madrid",
+  "title": "LaLiga Analytics",
+  "uid": "laliga-analytics-v1",
+  "version": 1
+}

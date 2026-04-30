@@ -67,5 +67,51 @@ services:
                --server.headless=true
                --theme.base=dark"
 
+  # ────────────────────────────────────────────────────────────────────
+  # Scheduler: ejecuta el pipeline ETL automaticamente cada dia a las 23:30
+  # ────────────────────────────────────────────────────────────────────
+  scheduler:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+    command: python /app/scripts/scheduler.py
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./models:/app/models
+      - ./src:/app/src
+      - ./scripts:/app/scripts
+
+  # ────────────────────────────────────────────────────────────────────
+  # Grafana: dashboard de metricas con datasource PostgreSQL
+  # Acceso: http://localhost:3000  admin / admin
+  # ────────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.4.0
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/laliga.json
+      # Credenciales para el datasource PostgreSQL (leidas en provisioning YAML)
+      PG_HOST: db
+      PG_PORT: "5432"
+      PG_DB: ${POSTGRES_DB}
+      PG_USER: ${POSTGRES_USER}
+      PG_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+
 volumes:
   postgres_data:
+  grafana_data:

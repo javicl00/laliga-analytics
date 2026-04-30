@@ -1,0 +1,17 @@
+apiVersion: 1
+
+datasources:
+  - name: LaLiga PostgreSQL
+    uid: laliga-pg
+    type: postgres
+    url: ${PG_HOST}:${PG_PORT}
+    database: ${PG_DB}
+    user: ${PG_USER}
+    secureJsonData:
+      password: ${PG_PASSWORD}
+    jsonData:
+      sslmode: disable
+      postgresVersion: 1600
+      timescaledb: false
+    editable: false
+    isDefault: true

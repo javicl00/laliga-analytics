@@ -5,7 +5,9 @@ Endpoints:
   GET  /teams                     -> lista de equipos
   GET  /matches/upcoming          -> partidos proximos
   GET  /matches/by-jornada?jornada=N -> partidos de una jornada concreta
-  POST /predict                   -> prediccion para un partido
+  POST /predict                   -> prediccion LightGBM (win/draw/loss)
+  POST /predict/goals             -> prediccion Dixon-Coles (marcador)
+  GET  /model/ratings             -> ratings ataque/defensa por equipo
   GET  /standings                 -> clasificacion actual
   POST /simulate/standings        -> simulacion Montecarlo de posicion final
 """
@@ -30,13 +32,14 @@ logger = logging.getLogger("uvicorn.error")
 app = FastAPI(
     title="LaLiga Analytics API",
     description="Predicciones de partidos LaLiga EA Sports",
-    version="0.2.0",
+    version="0.3.0",
 )
 
 _model_bundle: dict | None = None
+_dc_model = None
 _engine = None
 
-# Subconsulta reutilizable: equipos de Primera Division (clasificacion actual)
+# Equipos de Primera Division (clasificacion actual)
 _PRIMERA_TEAMS_SUBQUERY = """
     SELECT team_id FROM standings
     WHERE fetched_at = (SELECT MAX(fetched_at) FROM standings)
@@ -57,19 +60,54 @@ def load_model():
         if path.exists():
             with open(path, "rb") as f:
                 _model_bundle = pickle.load(f)
-            logger.info("Model loaded from %s", path)
+            logger.info("LightGBM model loaded from %s", path)
         else:
             logger.warning("Model file not found at %s", path)
     return _model_bundle
+
+
+def load_dc_model():
+    """Ajusta el modelo Dixon-Coles sobre el historico de Primera Division.
+
+    El ajuste tarda ~5-15s en arranque y se cachea en memoria.
+    """
+    global _dc_model
+    if _dc_model is None:
+        with get_engine().connect() as conn:
+            rows = conn.execute(text(f"""
+                SELECT match_id, home_team_id, away_team_id,
+                       home_score, away_score, kickoff_at
+                FROM matches
+                WHERE result IS NOT NULL
+                  AND home_score IS NOT NULL
+                  AND away_score IS NOT NULL
+                  AND competition_main = TRUE
+                  AND home_team_id IN ({_PRIMERA_TEAMS_SUBQUERY})
+                  AND away_team_id IN ({_PRIMERA_TEAMS_SUBQUERY})
+                ORDER BY kickoff_at
+            """)).mappings().all()
+
+        if rows:
+            df = pd.DataFrame([dict(r) for r in rows])
+            df["kickoff_at"] = pd.to_datetime(df["kickoff_at"], utc=True)
+            from src.models.dixon_coles import DixonColesModel
+            _dc_model = DixonColesModel().fit(df)
+            logger.info("Dixon-Coles model ready (%d matches)", len(df))
+        else:
+            logger.warning("No historical matches available for Dixon-Coles")
+    return _dc_model
 
 
 @app.on_event("startup")
 def startup():
     get_engine()
     load_model()
+    # Dixon-Coles se carga en background para no bloquear el arranque
+    import threading
+    threading.Thread(target=load_dc_model, daemon=True).start()
 
 
-# ── Schemas ──────────────────────────────────────────────────────────────────
+# ── Schemas ─────────────────────────────────────────────────────
 
 class PredictRequest(BaseModel):
     home_team_id: int
@@ -91,10 +129,10 @@ class SimulateRequest(BaseModel):
     simulations: int = 5000
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Helpers ─────────────────────────────────────────────────────
 
 def _predict_probs(home_id: int, away_id: int) -> tuple[float, float, float]:
-    """Devuelve (prob_home, prob_draw, prob_away) para un partido."""
+    """Prediccion LightGBM: devuelve (prob_home, prob_draw, prob_away)."""
     bundle = load_model()
     if bundle is None:
         return (0.45, 0.28, 0.27)
@@ -130,12 +168,16 @@ def _predict_probs(home_id: int, away_id: int) -> tuple[float, float, float]:
     )
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
+# ── Endpoints ─────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
     load_model()
-    return {"status": "ok", "model_loaded": _model_bundle is not None}
+    return {
+        "status": "ok",
+        "lgbm_loaded": _model_bundle is not None,
+        "dixon_coles_loaded": _dc_model is not None,
+    }
 
 
 @app.get("/teams")
@@ -164,7 +206,7 @@ def standings():
 
 @app.get("/matches/upcoming")
 def upcoming_matches(limit: int = 10):
-    """Partidos proximos de Primera Division (ambos equipos en standings actual)."""
+    """Partidos proximos de Primera Division."""
     with get_engine().connect() as conn:
         rows = conn.execute(text(f"""
             SELECT m.match_id, m.kickoff_at, m.gameweek_week,
@@ -206,8 +248,9 @@ def matches_by_jornada(jornada: int):
 
 @app.post("/predict", response_model=PredictResponse)
 def predict(req: PredictRequest):
+    """Prediccion con LightGBM (clasificacion: home/draw/away)."""
     if load_model() is None:
-        raise HTTPException(503, "Model not available")
+        raise HTTPException(503, "LightGBM model not available")
     ph, pd_, pa = _predict_probs(req.home_team_id, req.away_team_id)
     return PredictResponse(
         home_team_id=req.home_team_id,
@@ -219,11 +262,59 @@ def predict(req: PredictRequest):
     )
 
 
+@app.post("/predict/goals")
+def predict_goals(req: PredictRequest):
+    """Prediccion de marcador con modelo Dixon-Coles.
+
+    Devuelve:
+    - lambda_home / lambda_away: goles esperados
+    - prob_home / prob_draw / prob_away: probabilidades de resultado
+    - most_likely_score: marcador mas probable (e.g. '1-0')
+    - score_matrix: matriz 8x8 de probabilidades de marcador exacto
+    """
+    dc = load_dc_model()
+    if dc is None:
+        raise HTTPException(503, "Dixon-Coles model not available yet. Retry in a few seconds.")
+
+    try:
+        result = dc.predict(req.home_team_id, req.away_team_id)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+    return {
+        "home_team_id":      req.home_team_id,
+        "away_team_id":      req.away_team_id,
+        "model":             "dixon_coles_v1",
+        **result,
+    }
+
+
+@app.get("/model/ratings")
+def model_ratings():
+    """Ratings de ataque y defensa por equipo (Dixon-Coles).
+
+    Ataque alto -> equipo goleador.
+    Defensa alta (menos negativa) -> equipo solido defensivamente.
+    """
+    dc = load_dc_model()
+    if dc is None:
+        raise HTTPException(503, "Dixon-Coles model not available yet.")
+
+    with get_engine().connect() as conn:
+        team_names = {r["team_id"]: r["name"] for r in conn.execute(text(
+            "SELECT team_id, name FROM teams"
+        )).mappings().all()}
+
+    ratings = dc.team_ratings()
+    ratings["name"] = ratings["team_id"].map(team_names).fillna("Unknown")
+    ratings["attack"]  = ratings["attack"].round(4)
+    ratings["defense"] = ratings["defense"].round(4)
+    return {"ratings": ratings[["team_id", "name", "attack", "defense"]].to_dict(orient="records")}
+
+
 @app.post("/simulate/standings")
 def simulate_standings(req: SimulateRequest):
-    """Simulacion Montecarlo: distribucion de posicion final para un equipo.
-
-    Solo considera partidos entre equipos de Primera Division (standings actual).
+    """Simulacion Montecarlo de posicion final para un equipo de Primera.
 
     Campos de respuesta:
       pending_matches_count  -> partidos pendientes de Primera Division
@@ -241,7 +332,6 @@ def simulate_standings(req: SimulateRequest):
             WHERE s.fetched_at = (SELECT MAX(fetched_at) FROM standings)
         """)).mappings().all()
 
-        # Solo partidos donde AMBOS equipos esten en la clasificacion actual
         pending_rows = conn.execute(text(f"""
             SELECT m.match_id, m.home_team_id, m.away_team_id
             FROM matches m
@@ -258,13 +348,11 @@ def simulate_standings(req: SimulateRequest):
     pending_list  = list(pending_rows)
     pending_count = len(pending_list)
 
-    # Partidos pendientes que involucran al equipo solicitado
     team_pending_count = sum(
         1 for m in pending_list
         if m["home_team_id"] == req.team_id or m["away_team_id"] == req.team_id
     )
 
-    # Sin partidos pendientes: clasificacion final ya determinada
     if pending_count == 0:
         base_points = {r["team_id"]: r["points"] for r in standing_rows}
         base_gd     = {r["team_id"]: r["goal_difference"] for r in standing_rows}
