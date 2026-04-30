@@ -20,7 +20,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── CSS minimo ────────────────────────────────────────────────────────────────
+# ── CSS minimo ───────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
     .match-card {
@@ -40,13 +40,13 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=300)
 def get_teams():
     r = requests.get(f"{API}/teams", timeout=5)
     r.raise_for_status()
-    return r.json()["teams"]  # [{team_id, name, shortname}, ...]
+    return r.json()["teams"]
 
 
 @st.cache_data(ttl=60)
@@ -82,7 +82,6 @@ def simulate_standings(team_id: int, simulations: int = 5000):
 
 def prob_bar(home: float, draw: float, away: float,
              home_name: str, away_name: str) -> go.Figure:
-    """Barra horizontal tricolor con probabilidades."""
     fig = go.Figure()
     labels = [home_name, "Empate", away_name]
     values = [home * 100, draw * 100, away * 100]
@@ -111,14 +110,13 @@ def prob_bar(home: float, draw: float, away: float,
 
 
 def standings_chart(dist: dict, team_name: str) -> go.Figure:
-    """Grafico de barras con distribucion de posicion final."""
     positions = list(range(1, 21))
     probs = [dist.get(str(p), 0) * 100 for p in positions]
     colors = []
     for p in positions:
-        if p <= 4:      colors.append("#2ec4b6")   # Champions
-        elif p <= 6:    colors.append("#f4a261")   # Europa
-        elif p >= 18:   colors.append("#e63946")   # Descenso
+        if p <= 4:      colors.append("#2ec4b6")
+        elif p <= 6:    colors.append("#f4a261")
+        elif p >= 18:   colors.append("#e63946")
         else:           colors.append("#6c757d")
 
     fig = go.Figure(go.Bar(
@@ -139,14 +137,13 @@ def standings_chart(dist: dict, team_name: str) -> go.Figure:
         font=dict(color="#eee"),
         bargap=0.15,
     )
-    # Zonas de color en el fondo
     fig.add_vrect(x0=0.5, x1=4.5,   fillcolor="#2ec4b6", opacity=0.08, line_width=0)
     fig.add_vrect(x0=4.5, x1=6.5,   fillcolor="#f4a261", opacity=0.08, line_width=0)
     fig.add_vrect(x0=17.5, x1=20.5, fillcolor="#e63946", opacity=0.08, line_width=0)
     return fig
 
 
-# ── Sidebar ──────────────────────────────────────────────────────────────────
+# ── Sidebar ───────────────────────────────────────────────────────────────────────
 
 with st.sidebar:
     st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/a/a7/LaLiga_logo_2023.svg/200px-LaLiga_logo_2023.svg.png",
@@ -238,7 +235,6 @@ if seccion == "📅 Predicción por Jornada":
 
         st.divider()
 
-    # Predecir toda la jornada
     if st.session_state.get("predecir_jornada") == jornada:
         st.markdown("### Predicciones completas")
         rows = []
@@ -343,6 +339,18 @@ else:
             try:
                 result = simulate_standings(team_map[team_name], sims)
                 dist   = result["position_distribution"]
+                pending = result.get("pending_matches_count", -1)
+                season_complete = result.get("season_complete", False)
+
+                # Aviso si la temporada ya esta completada en BD
+                if season_complete or pending == 0:
+                    st.warning(
+                        "⚠️ La temporada almacenada está completada — no hay partidos pendientes "
+                        "en la base de datos. La posición mostrada es la clasificación final real. "
+                        "Ejecuta la ingestión de la temporada actual para simulaciones predictivas."
+                    )
+                else:
+                    st.info(f"🔄 Simulando sobre **{pending} partidos pendientes**")
 
                 st.plotly_chart(
                     standings_chart(dist, team_name),
@@ -350,7 +358,6 @@ else:
                     config={"displayModeBar": False},
                 )
 
-                # Tabla resumen
                 rows = []
                 for pos in range(1, 21):
                     prob = dist.get(str(pos), 0) * 100
@@ -367,16 +374,16 @@ else:
                     st.markdown("#### Posiciones con probabilidad ≥ 0.5%")
                     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-                # Métricas clave
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Champions (Top 4)",
-                          f"{sum(dist.get(str(p), 0) for p in range(1, 5)) * 100:.1f}%")
-                c2.metric("Europa (5-6)",
-                          f"{sum(dist.get(str(p), 0) for p in range(5, 7)) * 100:.1f}%")
-                c3.metric("Permanencia (7-17)",
-                          f"{sum(dist.get(str(p), 0) for p in range(7, 18)) * 100:.1f}%")
-                c4.metric("Descenso (18-20)",
-                          f"{sum(dist.get(str(p), 0) for p in range(18, 21)) * 100:.1f}%")
+                if not season_complete:
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("Champions (Top 4)",
+                              f"{sum(dist.get(str(p), 0) for p in range(1, 5)) * 100:.1f}%")
+                    c2.metric("Europa (5-6)",
+                              f"{sum(dist.get(str(p), 0) for p in range(5, 7)) * 100:.1f}%")
+                    c3.metric("Permanencia (7-17)",
+                              f"{sum(dist.get(str(p), 0) for p in range(7, 18)) * 100:.1f}%")
+                    c4.metric("Descenso (18-20)",
+                              f"{sum(dist.get(str(p), 0) for p in range(18, 21)) * 100:.1f}%")
 
             except Exception as e:
                 st.error(f"Error en simulación: {e}")

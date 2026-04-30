@@ -63,7 +63,7 @@ def startup():
     load_model()
 
 
-# ── Schemas ─────────────────────────────────────────────────────────────────────────
+# ── Schemas ───────────────────────────────────────────────────────────
 
 class PredictRequest(BaseModel):
     home_team_id: int
@@ -85,13 +85,13 @@ class SimulateRequest(BaseModel):
     simulations: int = 5000
 
 
-# ── Helpers ─────────────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────
 
 def _predict_probs(home_id: int, away_id: int) -> tuple[float, float, float]:
     """Devuelve (prob_home, prob_draw, prob_away) para un partido."""
     bundle = load_model()
     if bundle is None:
-        return (0.45, 0.28, 0.27)  # fallback frecuencia historica
+        return (0.45, 0.28, 0.27)
 
     with get_engine().connect() as conn:
         feat_row = conn.execute(text("""
@@ -103,15 +103,11 @@ def _predict_probs(home_id: int, away_id: int) -> tuple[float, float, float]:
         """), {"home": home_id, "away": away_id}).mappings().first()
 
     feat_cols = bundle["feature_cols"]
-    if feat_row is None:
-        feat_values = {c: None for c in feat_cols}
-    else:
-        feat_values = {c: feat_row.get(c) for c in feat_cols}
+    feat_values = {c: feat_row.get(c) if feat_row else None for c in feat_cols}
 
     X = pd.DataFrame([feat_values])[feat_cols]
     model = bundle["model"]
 
-    # NaN nativo para LightGBM, fillna(0) para sklearn
     from lightgbm import LGBMClassifier
     if not isinstance(model, LGBMClassifier):
         X = X.fillna(0)
@@ -128,7 +124,7 @@ def _predict_probs(home_id: int, away_id: int) -> tuple[float, float, float]:
     )
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────────
+# ── Endpoints ─────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
@@ -162,9 +158,7 @@ def standings():
 
 @app.get("/matches/upcoming")
 def upcoming_matches(limit: int = 10):
-    """Partidos proximos: filtra por result IS NULL (robusto frente a
-    variaciones en el campo status: 'Scheduled', 'NS', 'NotStarted', etc.)
-    """
+    """Partidos proximos: filtra por result IS NULL."""
     with get_engine().connect() as conn:
         rows = conn.execute(text("""
             SELECT m.match_id, m.kickoff_at, m.gameweek_week,
@@ -183,9 +177,7 @@ def upcoming_matches(limit: int = 10):
 
 @app.get("/matches/by-jornada")
 def matches_by_jornada(jornada: int):
-    """Partidos de una jornada: filtra por result IS NULL para incluir
-    todos los partidos pendientes independientemente del valor de status.
-    """
+    """Partidos de una jornada: filtra por result IS NULL."""
     with get_engine().connect() as conn:
         rows = conn.execute(text("""
             SELECT m.match_id, m.kickoff_at, m.gameweek_week,
@@ -219,7 +211,11 @@ def predict(req: PredictRequest):
 
 @app.post("/simulate/standings")
 def simulate_standings(req: SimulateRequest):
-    """Simulacion Montecarlo: distribucion de posicion final para un equipo."""
+    """Simulacion Montecarlo: distribucion de posicion final para un equipo.
+
+    Devuelve pending_matches_count para que el cliente sepa si la simulacion
+    tiene varianza real o la temporada ya esta completada.
+    """
     if load_model() is None:
         raise HTTPException(503, "Model not available")
 
@@ -231,7 +227,6 @@ def simulate_standings(req: SimulateRequest):
             WHERE s.fetched_at = (SELECT MAX(fetched_at) FROM standings)
         """)).mappings().all()
 
-        # Partidos pendientes: result IS NULL (mismo criterio que /upcoming)
         pending_rows = conn.execute(text("""
             SELECT m.match_id, m.home_team_id, m.away_team_id
             FROM matches m
@@ -243,8 +238,28 @@ def simulate_standings(req: SimulateRequest):
     if not standing_rows:
         raise HTTPException(404, "No hay clasificacion disponible")
 
+    pending_list = list(pending_rows)
+    pending_count = len(pending_list)
+
+    # Sin partidos pendientes: clasificacion final ya determinada
+    if pending_count == 0:
+        base_points = {r["team_id"]: r["points"] for r in standing_rows}
+        base_gd     = {r["team_id"]: r["goal_difference"] for r in standing_rows}
+        all_teams   = list(base_points.keys())
+        ranked = sorted(all_teams,
+                        key=lambda t: (base_points.get(t, 0), base_gd.get(t, 0)),
+                        reverse=True)
+        pos = ranked.index(req.team_id) + 1 if req.team_id in ranked else 20
+        return {
+            "team_id":               req.team_id,
+            "simulations":           0,
+            "pending_matches_count": 0,
+            "season_complete":        True,
+            "position_distribution": {str(pos): 1.0},
+        }
+
     match_probs = {}
-    for m in pending_rows:
+    for m in pending_list:
         ph, pd_, pa = _predict_probs(m["home_team_id"], m["away_team_id"])
         match_probs[m["match_id"]] = {
             "home_id": m["home_team_id"],
@@ -289,7 +304,9 @@ def simulate_standings(req: SimulateRequest):
                     for pos, cnt in sorted(position_counts.items())}
 
     return {
-        "team_id":              req.team_id,
-        "simulations":          N,
+        "team_id":               req.team_id,
+        "simulations":           N,
+        "pending_matches_count": pending_count,
+        "season_complete":        False,
         "position_distribution": distribution,
     }
