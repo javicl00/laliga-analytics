@@ -4,6 +4,11 @@ Todas las features son calculadas con datos disponibles
 EXCLUSIVAMENTE antes del kickoff del partido objetivo.
 Ninguna feature puede hacer referencia a resultados del partido objetivo
 ni a estadísticas acumuladas que incluyan ese partido.
+
+Esquema DB real (tabla matches):
+  scores  -> home_score / away_score  (smallint, nullable)
+  result  -> 'home' | 'draw' | 'away'
+  status  -> text (FullTime, FinishedPeriod, etc.)
 """
 from __future__ import annotations
 
@@ -61,6 +66,11 @@ FEATURE_CATALOG: Dict[str, Dict] = {
     "match_result": {"source": "targets", "window": "post_match", "allowed_inference": False, "note": "LEAKAGE"},
 }
 
+# Columnas de scores en la tabla matches
+_HOME_SCORE = "home_score"
+_AWAY_SCORE = "away_score"
+_FINISHED_STATUSES = {"FinishedPeriod", "FullTime", "Finished"}
+
 
 # ---------------------------------------------------------------------------
 # Ratings Elo
@@ -84,11 +94,11 @@ class EloRating:
         p_home = 1.0 / (1.0 + 10.0 ** ((r_away - r_home) / 400.0))
         return p_home, 1.0 - p_home
 
-    def update(self, home_id: int, away_id: int, home_goals: int, away_goals: int) -> None:
+    def update(self, home_id: int, away_id: int, home_score: int, away_score: int) -> None:
         p_home, p_away = self.expected(home_id, away_id)
-        if home_goals > away_goals:
+        if home_score > away_score:
             s_home, s_away = 1.0, 0.0
-        elif home_goals < away_goals:
+        elif home_score < away_score:
             s_home, s_away = 0.0, 1.0
         else:
             s_home, s_away = 0.5, 0.5
@@ -109,8 +119,8 @@ class FeatureBuilder:
     Parameters
     ----------
     matches_df:
-        DataFrame con columnas: match_id, season_id, gameweek, kickoff_at,
-        home_team_id, away_team_id, home_goals, away_goals, status.
+        DataFrame con columnas: match_id, season_id, gameweek_week, kickoff_at,
+        home_team_id, away_team_id, home_score, away_score, status.
     standings_df:
         DataFrame con columnas: season_id, gameweek_id, team_id, points,
         position, won, drawn, lost, goals_for, goals_against, snapshot_ts.
@@ -137,17 +147,12 @@ class FeatureBuilder:
         rows: List[Dict] = []
 
         for _, match in self.matches.iterrows():
-            if match.get("status") not in ("FinishedPeriod", "FullTime", "Finished", None, ""):
-                # Partido no jugado aún: incluir solo si se quiere para inferencia
-                pass
-
             match_id = match["match_id"]
-            gw = match.get("gameweek", -1)
+            gw = match.get("gameweek_week", -1)
             home_id = match["home_team_id"]
             away_id = match["away_team_id"]
 
             # Elo antes del partido
-            p_home_elo, _ = self._elo.expected(home_id, away_id)
             feats: Dict = {
                 "match_id": match_id,
                 "season_id": match.get("season_id"),
@@ -175,10 +180,10 @@ class FeatureBuilder:
             rows.append(feats)
 
             # Actualizar Elo DESPUÉS de añadir la fila (anti-leakage)
-            home_goals = match.get("home_goals")
-            away_goals = match.get("away_goals")
-            if pd.notna(home_goals) and pd.notna(away_goals):
-                self._elo.update(home_id, away_id, int(home_goals), int(away_goals))
+            home_score = match.get(_HOME_SCORE)
+            away_score = match.get(_AWAY_SCORE)
+            if pd.notna(home_score) and pd.notna(away_score):
+                self._elo.update(home_id, away_id, int(home_score), int(away_score))
 
         return pd.DataFrame(rows)
 
@@ -212,28 +217,39 @@ class FeatureBuilder:
         """Rolling de goles en los últimos 5 partidos (ANTES del actual)."""
         played = self.matches[
             (self.matches["match_id"] < current_match_id) &
-            (self.matches["status"].isin(["FinishedPeriod", "FullTime", "Finished"]))
+            (self.matches["status"].isin(_FINISHED_STATUSES))
         ]
-        def last_n_goals(team_id, is_home, n=5):
-            if is_home:
+
+        def last_n_goals_for(team_id, as_home: bool, n: int = 5) -> float:
+            if as_home:
                 m = played[played["home_team_id"] == team_id].tail(n)
-                return m["home_goals"].mean() if not m.empty else np.nan
+                return float(m[_HOME_SCORE].mean()) if not m.empty else np.nan
             else:
                 m = played[played["away_team_id"] == team_id].tail(n)
-                return m["away_goals"].mean() if not m.empty else np.nan
+                return float(m[_AWAY_SCORE].mean()) if not m.empty else np.nan
+
+        def last_n_goals_against(team_id, as_home: bool, n: int = 5) -> float:
+            if as_home:
+                m = played[played["home_team_id"] == team_id].tail(n)
+                return float(m[_AWAY_SCORE].mean()) if not m.empty else np.nan
+            else:
+                m = played[played["away_team_id"] == team_id].tail(n)
+                return float(m[_HOME_SCORE].mean()) if not m.empty else np.nan
+
         return {
-            "home_goals_for_last5": last_n_goals(home_id, True),
-            "home_goals_against_last5": last_n_goals(home_id, False),
-            "away_goals_for_last5": last_n_goals(away_id, False),
-            "away_goals_against_last5": last_n_goals(away_id, True),
+            "home_goals_for_last5": last_n_goals_for(home_id, as_home=True),
+            "home_goals_against_last5": last_n_goals_against(home_id, as_home=True),
+            "away_goals_for_last5": last_n_goals_for(away_id, as_home=False),
+            "away_goals_against_last5": last_n_goals_against(away_id, as_home=False),
         }
 
     def _rest_features(self, home_id: int, away_id: int, kickoff) -> Dict:
         """Días de descanso desde el último partido de cada equipo."""
         played = self.matches[
-            self.matches["status"].isin(["FinishedPeriod", "FullTime", "Finished"])
+            self.matches["status"].isin(_FINISHED_STATUSES)
         ]
-        def rest_days(team_id):
+
+        def rest_days(team_id) -> float:
             team_matches = played[
                 (played["home_team_id"] == team_id) | (played["away_team_id"] == team_id)
             ]
@@ -244,6 +260,7 @@ class FeatureBuilder:
             if pd.isna(last) or pd.isna(k):
                 return np.nan
             return float((k - last).days)
+
         return {
             "home_rest_days": rest_days(home_id),
             "away_rest_days": rest_days(away_id),
@@ -257,18 +274,18 @@ class FeatureBuilder:
         remaining = max(0, total_gw - gw)
         prev = self.standings[self.standings["gameweek_id"] == gw - 1]
 
-        def pressure(team_id):
+        def pressure(team_id) -> float:
             row = prev[prev["team_id"] == team_id]
             if row.empty:
                 return np.nan
             pos = float(row["position"].iloc[0])
-            pts = float(row["points"].iloc[0])
             # Alta presión si está en zona descenso (16-20) o lucha por título (1-4)
             if pos >= 16:
                 return float(remaining) / (remaining + 1.0) * (pos / 20.0)
             elif pos <= 4:
                 return float(remaining) / (remaining + 1.0) * (1.0 - pos / 20.0)
             return 0.1
+
         return {
             "home_pressure_index": pressure(home_id),
             "away_pressure_index": pressure(away_id),
