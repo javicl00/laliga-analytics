@@ -14,10 +14,12 @@ Endpoints:
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import pickle
 import random
+import threading
 from collections import defaultdict
 from pathlib import Path
 from typing import Optional
@@ -33,17 +35,21 @@ logger = logging.getLogger("uvicorn.error")
 app = FastAPI(
     title="LaLiga Analytics API",
     description="Predicciones de partidos LaLiga EA Sports",
-    version="0.4.0",
+    version="0.5.0",
 )
 
 _model_bundle: dict | None = None
 _dc_model = None
+_dc_lock = threading.Lock()
 _engine = None
 
 _PRIMERA_TEAMS_SUBQUERY = """
     SELECT team_id FROM standings
     WHERE fetched_at = (SELECT MAX(fetched_at) FROM standings)
 """
+
+_DC_MODEL_PATH = Path("models/dc_v1.pkl")
+_DC_HASH_PATH  = Path("models/dc_v1.hash")
 
 
 def get_engine():
@@ -66,38 +72,101 @@ def load_model():
     return _model_bundle
 
 
+def _fetch_dc_data() -> tuple[pd.DataFrame, str]:
+    """Obtiene el dataset de entrenamiento y su hash SHA-256.
+
+    El hash se calcula sobre los match_id ordenados para detectar
+    cambios en el conjunto de partidos entrenados.
+    """
+    with get_engine().connect() as conn:
+        rows = conn.execute(text(f"""
+            SELECT match_id, home_team_id, away_team_id,
+                   home_score, away_score, kickoff_at
+            FROM matches
+            WHERE result IS NOT NULL
+              AND home_score IS NOT NULL
+              AND away_score IS NOT NULL
+              AND competition_main = TRUE
+              AND home_team_id IN ({_PRIMERA_TEAMS_SUBQUERY})
+              AND away_team_id IN ({_PRIMERA_TEAMS_SUBQUERY})
+            ORDER BY kickoff_at
+        """)).mappings().all()
+
+    df = pd.DataFrame([dict(r) for r in rows]) if rows else pd.DataFrame()
+
+    if not df.empty:
+        ids_str = ",".join(str(i) for i in sorted(df["match_id"].tolist()))
+        data_hash = hashlib.sha256(ids_str.encode()).hexdigest()
+    else:
+        data_hash = "empty"
+
+    return df, data_hash
+
+
 def load_dc_model():
+    """Carga Dixon-Coles desde disco si el hash coincide; reajusta si no.
+
+    Estrategia:
+      1. Leer el dataset actual y calcular su hash SHA-256.
+      2. Si models/dc_v1.pkl existe Y models/dc_v1.hash == hash actual
+         → deserializar directamente (arranque instantáneo, <1s).
+      3. Si no → ajustar el modelo y persistir pkl + hash para el próximo arranque.
+
+    Thread-safe mediante _dc_lock para evitar ajustes concurrentes.
+    """
     global _dc_model
-    if _dc_model is None:
-        with get_engine().connect() as conn:
-            rows = conn.execute(text(f"""
-                SELECT match_id, home_team_id, away_team_id,
-                       home_score, away_score, kickoff_at
-                FROM matches
-                WHERE result IS NOT NULL
-                  AND home_score IS NOT NULL
-                  AND away_score IS NOT NULL
-                  AND competition_main = TRUE
-                  AND home_team_id IN ({_PRIMERA_TEAMS_SUBQUERY})
-                  AND away_team_id IN ({_PRIMERA_TEAMS_SUBQUERY})
-                ORDER BY kickoff_at
-            """)).mappings().all()
-        if rows:
-            df = pd.DataFrame([dict(r) for r in rows])
-            df["kickoff_at"] = pd.to_datetime(df["kickoff_at"], utc=True)
-            from src.models.dixon_coles import DixonColesModel
-            _dc_model = DixonColesModel().fit(df)
-            logger.info("Dixon-Coles fitted on %d matches", len(df))
-        else:
-            logger.warning("No historical matches for Dixon-Coles")
-    return _dc_model
+    with _dc_lock:
+        if _dc_model is not None:
+            return _dc_model
+
+        df, current_hash = _fetch_dc_data()
+
+        if df.empty:
+            logger.warning("No hay partidos históricos para Dixon-Coles")
+            return None
+
+        # ── Intentar cargar desde disco ──────────────────────────────────
+        if _DC_MODEL_PATH.exists() and _DC_HASH_PATH.exists():
+            saved_hash = _DC_HASH_PATH.read_text().strip()
+            if saved_hash == current_hash:
+                try:
+                    with open(_DC_MODEL_PATH, "rb") as f:
+                        _dc_model = pickle.load(f)
+                    logger.info(
+                        "Dixon-Coles cargado desde disco (hash=%s)", current_hash[:12]
+                    )
+                    return _dc_model
+                except Exception as e:
+                    logger.warning("Error al cargar DC desde disco: %s — reajustando", e)
+
+        # ── Reajustar ────────────────────────────────────────────────────
+        logger.info(
+            "Ajustando Dixon-Coles sobre %d partidos (hash=%s)...",
+            len(df), current_hash[:12],
+        )
+        df["kickoff_at"] = pd.to_datetime(df["kickoff_at"], utc=True)
+
+        from src.models.dixon_coles import DixonColesModel
+        model = DixonColesModel().fit(df)
+
+        # ── Persistir ────────────────────────────────────────────────────
+        _DC_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(_DC_MODEL_PATH, "wb") as f:
+                pickle.dump(model, f, protocol=pickle.HIGHEST_PROTOCOL)
+            _DC_HASH_PATH.write_text(current_hash)
+            logger.info("Dixon-Coles guardado en %s", _DC_MODEL_PATH)
+        except Exception as e:
+            logger.warning("No se pudo persistir DC en disco: %s", e)
+
+        _dc_model = model
+        return _dc_model
 
 
 @app.on_event("startup")
 def startup():
     get_engine()
     load_model()
-    import threading
     threading.Thread(target=load_dc_model, daemon=True).start()
 
 
@@ -155,8 +224,13 @@ def _predict_probs(home_id: int, away_id: int) -> tuple[float, float, float]:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "lgbm_loaded": _model_bundle is not None,
-            "dixon_coles_loaded": _dc_model is not None}
+    return {
+        "status": "ok",
+        "lgbm_loaded":         _model_bundle is not None,
+        "dixon_coles_loaded":  _dc_model is not None,
+        "dc_persisted":        _DC_MODEL_PATH.exists(),
+        "dc_hash":             _DC_HASH_PATH.read_text().strip() if _DC_HASH_PATH.exists() else None,
+    }
 
 
 @app.get("/teams")
@@ -221,7 +295,7 @@ def matches_by_jornada(jornada: int):
 
 @app.get("/matches/history")
 def match_history(home_team_id: int, away_team_id: int, limit: int = 15):
-    """Historial directo entre dos equipos (en cualquier rol local/visitante)."""
+    """Historial directo entre dos equipos (cualquier rol local/visitante)."""
     with get_engine().connect() as conn:
         rows = conn.execute(text("""
             SELECT m.match_id, m.kickoff_at, m.gameweek_week,
@@ -283,6 +357,24 @@ def model_ratings():
     return {"ratings": ratings[["team_id", "name", "attack", "defense"]].to_dict(orient="records")}
 
 
+@app.post("/model/retrain-dc")
+def retrain_dc():
+    """Fuerza el reajuste de Dixon-Coles e invalida la caché en disco.
+
+    Útil tras ingestar nuevos partidos sin reiniciar el contenedor.
+    """
+    global _dc_model
+    with _dc_lock:
+        _dc_model = None
+        if _DC_MODEL_PATH.exists():
+            _DC_MODEL_PATH.unlink()
+        if _DC_HASH_PATH.exists():
+            _DC_HASH_PATH.unlink()
+
+    threading.Thread(target=load_dc_model, daemon=True).start()
+    return {"status": "retraining_started"}
+
+
 @app.post("/simulate/standings")
 def simulate_standings(req: SimulateRequest):
     if load_model() is None:
@@ -303,8 +395,8 @@ def simulate_standings(req: SimulateRequest):
         """)).mappings().all()
     if not standing_rows:
         raise HTTPException(404, "No hay clasificacion disponible")
-    pending_list  = list(pending_rows)
-    pending_count = len(pending_list)
+    pending_list       = list(pending_rows)
+    pending_count      = len(pending_list)
     team_pending_count = sum(
         1 for m in pending_list
         if m["home_team_id"] == req.team_id or m["away_team_id"] == req.team_id
