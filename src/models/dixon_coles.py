@@ -12,6 +12,7 @@ Referencia:
 from __future__ import annotations
 
 import logging
+import math
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -20,6 +21,23 @@ from scipy.optimize import minimize
 from scipy.stats import poisson
 
 logger = logging.getLogger(__name__)
+
+# Limites para parametros alpha/beta en log-escala.
+# exp(4) ~ 54 goles esperados — imposible en futbol real.
+# Evita que SLSQP diverja hacia +/-Inf en equipos con pocos partidos.
+_PARAM_BOUND = 4.0
+
+# Rango seguro para lambda/mu (goles esperados por partido).
+# Por encima de 15 la PMF de Poisson es numericamente irrelevante.
+_LAMBDA_MIN = 0.01
+_LAMBDA_MAX = 15.0
+
+
+def _safe_float(v: float) -> float:
+    """Convierte NaN/Inf a 0.0 para garantizar serializacion JSON segura."""
+    if math.isfinite(v):
+        return v
+    return 0.0
 
 
 class DixonColesModel:
@@ -78,10 +96,10 @@ class DixonColesModel:
         df: pd.DataFrame,
     ) -> float:
         n = len(self.teams_)
-        alpha  = params[:n]          # ataque
-        beta   = params[n:2 * n]    # defensa
-        gamma  = params[2 * n]      # ventaja campo
-        rho    = params[2 * n + 1]  # correccion
+        alpha  = params[:n]
+        beta   = params[n:2 * n]
+        gamma  = params[2 * n]
+        rho    = params[2 * n + 1]
 
         ll = 0.0
         for row in df.itertuples(index=False):
@@ -136,6 +154,15 @@ class DixonColesModel:
         x0[2 * n]     =  0.3   # gamma: ventaja de campo
         x0[2 * n + 1] = -0.1   # rho
 
+        # Bounds: alpha y beta acotados a [-_PARAM_BOUND, +_PARAM_BOUND]
+        # para evitar divergencia numerica en equipos con pocos partidos.
+        # gamma libre; rho acotado a (-1, 0] segun teoria Dixon-Coles.
+        param_bounds = (
+            [(-_PARAM_BOUND, _PARAM_BOUND)] * (2 * n)  # alpha + beta
+            + [(None, None)]                             # gamma
+            + [(-1.0, 0.0)]                              # rho
+        )
+
         # Restriccion de identificabilidad: sum(alpha) = 0
         constraints = [{"type": "eq", "fun": lambda p, n=n: np.sum(p[:n])}]
 
@@ -145,9 +172,17 @@ class DixonColesModel:
             x0,
             args=(df[["home_team_id", "away_team_id", "home_score", "away_score", "weight"]],),
             method="SLSQP",
+            bounds=param_bounds,
             constraints=constraints,
             options={"maxiter": 500, "ftol": 1e-8},
         )
+
+        if not result.success:
+            logger.warning(
+                "Dixon-Coles no convergio completamente: %s "
+                "(los parametros pueden ser suboptimos pero son finitos)",
+                result.message,
+            )
 
         self.params_ = result.x
         self.fitted_ = True
@@ -192,8 +227,10 @@ class DixonColesModel:
         gamma = self.params_[2 * n]
         rho   = self.params_[2 * n + 1]
 
-        lam = float(np.exp(alpha[hi] + beta[ai] + gamma))
-        mu  = float(np.exp(alpha[ai] + beta[hi]))
+        # Clamp lambda/mu para garantizar valores finitos en la PMF de Poisson.
+        # Los bounds en fit() hacen que esto sea raro, pero es una red de seguridad.
+        lam = float(np.clip(np.exp(alpha[hi] + beta[ai] + gamma), _LAMBDA_MIN, _LAMBDA_MAX))
+        mu  = float(np.clip(np.exp(alpha[ai] + beta[hi]),          _LAMBDA_MIN, _LAMBDA_MAX))
 
         # Matriz de probabilidad de marcadores
         matrix = np.zeros((max_goals, max_goals))
@@ -202,14 +239,17 @@ class DixonColesModel:
                 tau = self._tau(x, y, lam, mu, rho)
                 matrix[x, y] = tau * poisson.pmf(x, lam) * poisson.pmf(y, mu)
 
+        # Sustituir cualquier NaN/Inf residual por 0 antes de renormalizar
+        matrix = np.nan_to_num(matrix, nan=0.0, posinf=0.0, neginf=0.0)
+
         # Renormalizacion por truncamiento
         total = matrix.sum()
         if total > 0:
             matrix /= total
 
-        prob_home = float(np.sum(np.tril(matrix, -1)))
-        prob_draw = float(np.sum(np.diag(matrix)))
-        prob_away = float(np.sum(np.triu(matrix, 1)))
+        prob_home = _safe_float(float(np.sum(np.tril(matrix, -1))))
+        prob_draw = _safe_float(float(np.sum(np.diag(matrix))))
+        prob_away = _safe_float(float(np.sum(np.triu(matrix, 1))))
 
         best = np.unravel_index(matrix.argmax(), matrix.shape)
 
@@ -220,7 +260,10 @@ class DixonColesModel:
             "prob_draw":         round(prob_draw, 4),
             "prob_away":         round(prob_away, 4),
             "most_likely_score": f"{best[0]}-{best[1]}",
-            "score_matrix":      [[round(v, 6) for v in row] for row in matrix.tolist()],
+            "score_matrix":      [
+                [round(_safe_float(v), 6) for v in row]
+                for row in matrix.tolist()
+            ],
         }
 
     # ------------------------------------------------------------------
@@ -228,12 +271,18 @@ class DixonColesModel:
     # ------------------------------------------------------------------
 
     def team_ratings(self) -> pd.DataFrame:
-        """Devuelve DataFrame con attack/defense rating por equipo."""
+        """Devuelve DataFrame con attack/defense rating por equipo.
+
+        Los valores NaN/Inf (posible si SLSQP no converge) se sustituyen
+        por 0.0 para garantizar serializacion JSON segura en la API.
+        """
         if not self.fitted_:
             raise RuntimeError("Modelo no ajustado")
         n = len(self.teams_)
+        attack  = [_safe_float(v) for v in self.params_[:n].tolist()]
+        defense = [_safe_float(v) for v in self.params_[n:2 * n].tolist()]
         return pd.DataFrame({
             "team_id": self.teams_,
-            "attack":  self.params_[:n].tolist(),
-            "defense": self.params_[n:2 * n].tolist(),
+            "attack":  attack,
+            "defense": defense,
         }).sort_values("attack", ascending=False)
